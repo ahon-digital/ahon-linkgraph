@@ -215,6 +215,15 @@ def body():
         check("record shortened inside a shard refused", r.returncode != 0, r.stderr.strip()[:80])
     else:
         check("fixture: last record has 2..127 links", False, str(cnt))
+    # review round 4: numbers that wrap must be refused, as arguments and inside the index
+    os.makedirs(f"{W}/wrap1")
+    r = run("merge", "4294967299", f"cat {r2}/h-*.bin", f"{r2}/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/wrap1", "2", ok=False)
+    check("wrapping release index refused", r.returncode != 0)
+    os.makedirs(f"{W}/wrap2/src"); [shutil.copy(f"{r2}/{x}", f"{W}/wrap2/src/{x}") for x in os.listdir(r2)]
+    lines = open(f"{W}/wrap2/src/history.idx").read().splitlines(); lines[0] = "#release\t4294967298"
+    open(f"{W}/wrap2/src/history.idx", "w").write("\n".join(lines) + "\n"); os.makedirs(f"{W}/wrap2/out")
+    r = run("merge", "3", f"cat {r2}/h-*.bin", f"{W}/wrap2/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/wrap2/out", "2", ok=False)
+    check("wrapping release in the index refused", r.returncode != 0)
     idx_lines = open(f"{r2}/history.idx").read().splitlines()
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"

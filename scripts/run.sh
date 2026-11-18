@@ -17,9 +17,23 @@ log() { echo "== $(date -u +%FT%TZ) $*"; }
 
 log "release list"
 if [ -n "${LG_RELEASE_LIST:-}" ]; then cp "$LG_RELEASE_LIST" all.txt; else python3 "$here/releases.py" > all.txt; fi
-rc=0; python3 "$here/hf.py" get releases.tsv done.tsv || rc=$?
-if [ "$rc" = 3 ]; then : > done.tsv; elif [ "$rc" != 0 ]; then echo "cannot read the release log"; exit 1; fi
+# Where the history stands, from all three pieces at once. They must agree; a fresh start is allowed only when
+# none exists. One missing piece next to the others is a broken dataset, never "start over".
+st() { local rc=0; "$@" || rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ] || { echo "cannot read the dataset's state"; exit 1; }; echo "$rc"; }
+rel_rc=$(st python3 "$here/hf.py" get releases.tsv done.tsv)
+idx_rc=$(st python3 "$here/hf.py" get history/history.idx prev.idx)
+dom_rc=$(st python3 "$here/hf.py" exists domains.txt)
+for v in "$rel_rc" "$idx_rc" "$dom_rc"; do case "$v" in 0|3) ;; *) echo "cannot read the dataset's state: stop"; exit 1;; esac; done
+if [ "$rel_rc" = 3 ]; then
+  [ "$idx_rc" = 3 ] && [ "$dom_rc" = 3 ] || { echo "dataset holds history but no release log: stop"; exit 1; }
+  : > done.tsv
+fi
 n_done=$(grep -c . done.tsv || true)
+awk -F'\t' -v n="$n_done" '$1 != NR - 1 { bad = 1 } END { exit bad || NR != n }' done.tsv || { echo "release log is not numbered 0..n-1: stop"; exit 1; }
+if [ "$n_done" -gt 0 ]; then
+  [ "$idx_rc" = 0 ] && [ "$dom_rc" = 0 ] || { echo "release log without history or domains: stop"; exit 1; }
+  [ "$(head -1 prev.idx)" = "$(printf '#release\t%d' $((n_done - 1)))" ] || { echo "history index and release log disagree: stop"; exit 1; }
+fi
 # the history must be a prefix of Common Crawl's order; anything else stops the build instead of guessing
 cut -f2 done.tsv > done_names.txt
 awk -v n="$n_done" 'NR <= n' all.txt | cmp -s - done_names.txt || { echo "release log is not a prefix of Common Crawl's order: stop"; exit 1; }
@@ -53,7 +67,6 @@ log "merge into history"
 [ "${LG_DRY:-0}" = 1 ] || python3 "$here/hf.py" ensure
 rm -rf hist manifest.tsv; mkdir hist; : > manifest.tsv
 if [ "$RI" = 0 ]; then PREV=-; PREVIDX=-; else
-  python3 "$here/hf.py" get history/history.idx prev.idx
   PREVIDX=prev.idx
   PREV="python3 '$here/hf.py' cat $(grep -v '^#' prev.idx | cut -f1 | uniq | awk '{printf "history/h-%05d.bin ", $1}')"
 fi

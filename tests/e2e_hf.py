@@ -92,6 +92,17 @@ try:
     got = {(l.split("\t")[0], l.split("\t")[1]): [int(l.split("\t")[2]), int(l.split("\t")[3])] for l in dump}
     if got != ref:
         fails.append(f"published history differs: {len(got)} vs {len(ref)} links")
+    # review round 4: remove only the release log; the next run must stop and the history must stay
+    body = (json.dumps({"key": "header", "value": {"summary": "e2e: drop the release log"}}) + "\n" +
+            json.dumps({"key": "deletedFile", "value": {"path": "releases.tsv"}}) + "\n").encode()
+    urllib.request.urlopen(urllib.request.Request(f"{H}/api/datasets/{REPO}/commit/main", data=body, method="POST",
+                           headers=dict(hdr, **{"Content-Type": "application/x-ndjson"})), timeout=120)
+    p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=f"{T}/nolog"), capture_output=True, text=True)
+    if p.returncode == 0 or "no release log" not in p.stdout:
+        fails.append(f"missing release log not refused (exit {p.returncode})")
+    idx_after = get("history/history.idx")
+    if idx_after != idx:
+        fails.append("history changed after the refused run")
     print(json.dumps({"releases": len(rel), "links": len(got), "shards": len(local_shards), "fails": fails}))
 finally:
     if exists(): urllib.request.urlopen(urllib.request.Request(f"https://huggingface.co/api/repos/delete", method="DELETE",

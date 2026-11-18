@@ -33,6 +33,23 @@
 #include <errno.h>
 
 static void die(const char *m) { fprintf(stderr, "lg: %s\n", m); exit(2); }
+// Strict decimal: digits only, no sign, no overflow, at most max. Anything else stops.
+static uint64_t num(const char *s, uint64_t max, const char *what) {
+  uint64_t v = 0;
+  if (!s || !*s) { fprintf(stderr, "lg: %s is empty\n", what); exit(2); }
+  for (const char *p = s; *p; p++) {
+    if (*p < '0' || *p > '9' || v > (UINT64_MAX - 9) / 10) { fprintf(stderr, "lg: %s is not a number in range\n", what); exit(2); }
+    v = v * 10 + (uint64_t)(*p - '0');
+  }
+  if (v > max) { fprintf(stderr, "lg: %s is out of range\n", what); exit(2); }
+  return v;
+}
+// Splits a tab-separated index line into at most n strict numbers; returns how many fields it had.
+static int fields(char *line, uint64_t *out, int n, uint64_t max, const char *what) {
+  line[strcspn(line, "\r\n")] = 0; int k = 0; char *save = NULL;
+  for (char *t = strtok_r(line, "\t", &save); t; t = strtok_r(NULL, "\t", &save)) { if (k == n) return n + 1; out[k++] = num(t, max, what); }
+  return k;
+}
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("out of memory"); return p; }
 static void *xcalloc(size_t n, size_t s) { void *p = calloc(n ? n : 1, s); if (!p) die("out of memory"); return p; }
 static void *xrealloc(void *p, size_t n) { p = realloc(p, n ? n : 1); if (!p) die("out of memory"); return p; }
@@ -247,16 +264,20 @@ static void hist_put(HistOut *w, const Rec *r) {
 
 // Reads a history index: the release it was built through and how many distinct shards it lists.
 static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_t **recs, uint64_t **bytes) {
-  FILE *f = xopen(p, "rb"); char line[512]; uint64_t sh, o, t, last = UINT64_MAX, n, rc, by, nrec = 0; *shards = 0;
+  FILE *f = xopen(p, "rb"); char line[512]; uint64_t sh, last = UINT64_MAX, nrec = 0, v[3]; *shards = 0;
   *recs = xmalloc(8 * 64); *bytes = xmalloc(8 * 64); uint64_t cap = 64;
-  if (!fgets(line, sizeof line, f) || sscanf(line, "#release\t%d", release) != 1) die("history index has no #release line");
+  if (!fgets(line, sizeof line, f) || strncmp(line, "#release\t", 9)) die("history index has no #release line");
+  line[strcspn(line, "\r\n")] = 0; *release = (int)num(line + 9, 254, "the index's release");
+  const uint64_t BIG = 1ULL << 48;
   while (fgets(line, sizeof line, f)) {
     if (!strncmp(line, "#shard\t", 7)) {
-      if (sscanf(line, "#shard\t%llu\t%llu\t%llu", (unsigned long long *)&n, (unsigned long long *)&rc, (unsigned long long *)&by) != 3 || n != nrec) die("bad #shard line in the history index");
+      if (fields(line + 7, v, 3, BIG, "an index #shard field") != 3 || v[0] != nrec) die("bad #shard line in the history index");
+      uint64_t rc = v[1], by = v[2];
       if (nrec == cap) { cap *= 2; *recs = xrealloc(*recs, cap * 8); *bytes = xrealloc(*bytes, cap * 8); }
       (*recs)[nrec] = rc; (*bytes)[nrec] = by; nrec++; continue;
     }
-    if (sscanf(line, "%llu\t%llu\t%llu", (unsigned long long *)&sh, (unsigned long long *)&o, (unsigned long long *)&t) != 3) die("bad history index line");
+    if (fields(line, v, 3, BIG, "an index field") != 3) die("bad history index line");
+    sh = v[0];
     if (sh != last) { if (last != UINT64_MAX && sh != last + 1) die("history index shards not consecutive"); (*shards)++; last = sh; }
   }
   fclose(f);
@@ -336,10 +357,10 @@ static Names load_names(const char *p) {
 }
 static int cmd_dump(const char *dir, const char *namesp) {
   Names nm = load_names(namesp); char ip[4096]; snprintf(ip, sizeof ip, "%s/history.idx", dir);
-  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, lastsh = UINT64_MAX; Rec r = {0}; char ln[512];
+  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, lastsh = UINT64_MAX; Rec r = {0}; char ln[512]; (void)offv; (void)ft;
   while (fgets(ln, sizeof ln, ix)) {
     if (ln[0] == '#') continue;
-    if (sscanf(ln, "%llu\t%llu\t%llu", (unsigned long long *)&sh, (unsigned long long *)&offv, (unsigned long long *)&ft) != 3) die("bad history index line");
+    { uint64_t v[3]; if (fields(ln, v, 3, 1ULL << 48, "an index field") != 3) die("bad history index line"); sh = v[0]; offv = v[1]; ft = v[2]; }
     if (sh == lastsh) continue; lastsh = sh;
     char p[4096]; snprintf(p, sizeof p, "%s/h-%05llu.bin", dir, (unsigned long long)sh);
     HistIn h = { .f = xopen(p, "rb") };
@@ -366,7 +387,7 @@ static int cmd_lookup(const char *dir, const char *namesp, const char *domain) {
   FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, bsh = UINT64_MAX, boff = 0; char ln[512];
   while (fgets(ln, sizeof ln, ix)) {
     if (ln[0] == '#') continue;
-    if (sscanf(ln, "%llu\t%llu\t%llu", (unsigned long long *)&sh, (unsigned long long *)&offv, (unsigned long long *)&ft) != 3) die("bad history index line");
+    { uint64_t v[3]; if (fields(ln, v, 3, 1ULL << 48, "an index field") != 3) die("bad history index line"); sh = v[0]; offv = v[1]; ft = v[2]; }
     if (ft > id) break; bsh = sh; boff = offv;
   }
   fclose(ix);
@@ -387,8 +408,8 @@ static int cmd_lookup(const char *dir, const char *namesp, const char *domain) {
 int main(int argc, char **argv) {
   if (argc == 3 && !strcmp(argv[1], "names")) return cmd_names(argv[2]);
   if (argc == 7 && !strcmp(argv[1], "dictmerge")) return cmd_dictmerge(argv[2], argv[3], argv[4], argv[5], argv[6]);
-  if (argc == 7 && !strcmp(argv[1], "inbound")) return cmd_inbound(strtoull(argv[2], 0, 10), strtoull(argv[3], 0, 10), argv[4], argv[5], argv[6]);
-  if ((argc == 9 || argc == 10) && !strcmp(argv[1], "merge")) return cmd_merge(atoi(argv[2]), argv[3], argv[4], argv[5], argv[6], argv[7], strtoull(argv[8], 0, 10), argc == 10 ? argv[9] : NULL);
+  if (argc == 7 && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6]);
+  if ((argc == 9 || argc == 10) && !strcmp(argv[1], "merge")) return cmd_merge((int)num(argv[2], 254, "REL_INDEX"), argv[3], argv[4], argv[5], argv[6], argv[7], num(argv[8], 1ULL << 24, "SHARD_KB"), argc == 10 ? argv[9] : NULL);
   if (argc == 4 && !strcmp(argv[1], "dump")) return cmd_dump(argv[2], argv[3]);
   if (argc == 5 && !strcmp(argv[1], "lookup")) return cmd_lookup(argv[2], argv[3], argv[4]);
   fprintf(stderr, "usage: see the header of lg.c\n"); return 2;

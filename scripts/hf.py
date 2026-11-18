@@ -5,6 +5,7 @@ Environment: HF_TOKEN (write token, org-scoped), LG_REPO (e.g. ahon-digital/link
 
     hf.py ensure                       create the dataset (public: raw link history only, never scores) if missing
     hf.py get REMOTE OUT               download one file; exit 3 if it does not exist, 1 on any other failure
+    hf.py exists REMOTE                exit 0 if the file exists, 3 if not, 1 if that cannot be told
     hf.py cat REMOTE...                stream files to stdout in order (previous history shards)
     hf.py put LOCAL REMOTE MANIFEST    upload LOCAL as a large-file object, append "REMOTE oid size" to MANIFEST
     hf.py commit MESSAGE MANIFEST [--delete-missing PREFIX]
@@ -40,12 +41,25 @@ class _Redirect(urllib.request.HTTPRedirectHandler):
 
 
 OPENER = urllib.request.build_opener(_Redirect)
+_SECRET_HEADERS = {"authorization", "proxy-authorization", "cookie"}
+
+
+def safe_headers(url, extra):
+    """Headers for a request to url. Credential headers from anyone else (for example an upload action in a
+    server reply) are always dropped; our token is added only for huggingface.co."""
+    h = {k: v for k, v in (extra or {}).items() if k.lower() not in _SECRET_HEADERS}
+    if _hf(url):
+        h["Authorization"] = "Bearer " + TOKEN
+    return h
+
+
+def redact(text):
+    return str(text).replace(TOKEN, "[token]") if TOKEN else str(text)
 
 
 def req(method, url, data=None, headers=None, stream=False, timeout=300, tries=4):
     # The token goes to huggingface.co only, never to an address taken from a reply that points elsewhere.
-    h = {"Authorization": "Bearer " + TOKEN} if _hf(url) else {}
-    h.update(headers or {})
+    h = safe_headers(url, headers)
     for attempt in range(tries):
         try:
             r = OPENER.open(urllib.request.Request(url, data=data, headers=h, method=method), timeout=timeout)
@@ -190,7 +204,7 @@ def put(local, remote, manifest):
                     chunk = f.read(cs)
                     for attempt in range(4):
                         try:
-                            with OPENER.open(urllib.request.Request(hdr[k], data=chunk, method="PUT"), timeout=900) as x:
+                            with OPENER.open(urllib.request.Request(hdr[k], data=chunk, headers=safe_headers(hdr[k], {}), method="PUT"), timeout=900) as x:
                                 etags.append({"partNumber": i + 1, "etag": x.headers["ETag"]})
                             break
                         except (urllib.error.URLError, TimeoutError):
@@ -202,7 +216,7 @@ def put(local, remote, manifest):
                 sys.exit(f"hf.py: multipart completion failed {st}")
         else:
             with open(local, "rb") as f:
-                headers = dict(hdr)
+                headers = safe_headers(up["href"], hdr)
                 headers["Content-Length"] = str(size)
                 r = urllib.request.Request(up["href"], data=f, headers=headers, method="PUT")
                 with OPENER.open(r, timeout=3600) as x:
@@ -257,10 +271,12 @@ def squash():
     return 0
 
 
-if __name__ == "__main__":
+def main():
     a = sys.argv[1:]
     if a[:1] == ["ensure"]:
         sys.exit(ensure())
+    if a[:1] == ["exists"] and len(a) == 2:
+        sys.exit(0 if meta(a[1]) is not None else 3)
     if a[:1] == ["get"] and len(a) == 3:
         sys.exit(get(a[1], a[2]))
     if a[:1] == ["cat"] and len(a) >= 2:
@@ -272,3 +288,21 @@ if __name__ == "__main__":
     if a[:1] == ["squash"]:
         sys.exit(squash())
     sys.exit(__doc__)
+
+
+def guarded(fn):
+    """Outermost guard: whatever happens inside, nothing that leaves this process carries the token."""
+    try:
+        fn()
+    except SystemExit as e:
+        if e.code is None or isinstance(e.code, int):
+            raise
+        print(redact(e.code), file=sys.stderr)
+        sys.exit(1)
+    except BaseException as e:   # an unexpected error prints its type only, never its text or traceback
+        print(f"hf.py: failed: {type(e).__name__}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    guarded(main)

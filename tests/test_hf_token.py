@@ -92,6 +92,49 @@ def test_exception_text_scrubbed():
     assert msg and "leakedvalue" not in msg
 
 
+def test_upload_reply_headers_cannot_carry_token_off_host():
+    hf = load(); sent = []
+    import json as _j
+    def fake_req(method, url, data=None, headers=None, stream=False, timeout=0, tries=4):
+        return 200, _j.dumps({"objects": [{"actions": {"upload": {"href": "https://storage.example/object",
+                   "header": {"Authorization": "Bearer " + hf.TOKEN, "X-Amz": "1"}}}}]}).encode()
+    hf.req = fake_req
+    class Ok:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    hf.OPENER.open = lambda r, timeout=0: (sent.append((r.full_url, dict(r.header_items()))), Ok())[1]
+    import tempfile
+    f = tempfile.NamedTemporaryFile(delete=False); f.write(b"data"); f.close()
+    hf.put(f.name, "x.bin", f.name + ".manifest")
+    assert sent and all(hf.TOKEN not in str(h) for _, h in sent), sent
+
+
+def _guard_output(fn):
+    hf = load()
+    import contextlib
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        try:
+            hf.guarded(lambda: fn(hf))
+            code = 0
+        except SystemExit as e:
+            code = e.code
+    return code, err.getvalue(), hf.TOKEN
+
+
+def test_error_body_redacted():
+    code, out, tok = _guard_output(lambda hf: sys.exit(f"hf.py: commit failed 400: Authorization: Bearer {hf.TOKEN}"))
+    assert code == 1 and tok not in out and "[token]" in out
+
+
+def test_exception_prints_type_only():
+    def boom(hf):
+        raise RuntimeError("header was Bearer " + hf.TOKEN)
+    code, out, tok = _guard_output(boom)
+    assert code == 1 and tok not in out and "RuntimeError" in out
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0
