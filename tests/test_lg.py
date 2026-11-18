@@ -246,6 +246,18 @@ def body():
     check("carriage-return junk in the index refused", r.returncode != 0)
     r = run("names", f"{W}/crn.txt", ok=False, stdin="0\tcom.a\rjunk\t1\n")
     check("carriage return in a vertex name refused", r.returncode != 0)
+    # review round 7: a NUL byte never ends a field early; checkidx validates a whole index
+    r = run("names", f"{W}/nul.txt", ok=False, stdin="0\tcom.a\0junk\t1\n")
+    check("NUL in a vertex name refused", r.returncode != 0)
+    os.makedirs(f"{W}/nul/src"); [shutil.copy(f"{r2}/{x}", f"{W}/nul/src/{x}") for x in os.listdir(r2)]
+    raw = open(f"{W}/nul/src/history.idx", "rb").read().split(b"\n"); raw[0] = raw[0] + b"\0junk"
+    open(f"{W}/nul/src/history.idx", "wb").write(b"\n".join(raw)); os.makedirs(f"{W}/nul/out")
+    r = run("merge", "3", f"cat {r2}/h-*.bin", f"{W}/nul/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/nul/out", "2", ok=False)
+    check("NUL in the index refused", r.returncode != 0)
+    good = run("checkidx", f"{r2}/history.idx").stdout.strip()
+    check("checkidx names the release", good == "2", good)
+    open(f"{W}/junkidx", "w").write(open(f"{r2}/history.idx").read() + "NOT AN INDEX\n")
+    check("checkidx refuses a junk line", run("checkidx", f"{W}/junkidx", ok=False).returncode != 0)
     idx_lines = open(f"{r2}/history.idx").read().splitlines()
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"

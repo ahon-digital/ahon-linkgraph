@@ -57,6 +57,9 @@ class _Boundary(urllib.request.BaseHandler):
             parts = [req.full_url] + [f"{k}: {v}" for k, v in req.header_items()]
             if isinstance(req.data, (bytes, bytearray)):
                 parts.append(req.data.decode("latin-1"))
+            elif req.data is not None and not getattr(req, "lg_scanned", False):
+                # a streamed body we cannot read here goes off-host only if put() scanned the file first
+                raise SystemExit("hf.py: refused an unscanned streamed body off huggingface.co")
             if any(TOKEN in p for p in parts):
                 raise SystemExit("hf.py: refused a request off huggingface.co that would have carried the token")
         return req
@@ -193,12 +196,17 @@ def cat(remotes):
 
 
 def sha256_size(path):
-    h, n = hashlib.sha256(), 0
+    """Hash and size of a file to upload, in one pass that also refuses a file containing the token (checked across
+    chunk boundaries). Our uploads are built from public Common Crawl data and never should hold it."""
+    h, n, t, tail = hashlib.sha256(), 0, TOKEN.encode(), b""
     with open(path, "rb") as f:
         while True:
             c = f.read(1 << 22)
             if not c:
                 break
+            if t and t in tail + c:
+                raise SystemExit("hf.py: refusing to upload a file that contains the token")
+            tail = (tail + c)[-(len(t) - 1):] if t else b""
             h.update(c)
             n += len(c)
     return h.hexdigest(), n
@@ -228,7 +236,8 @@ def put(local, remote, manifest):
                     chunk = f.read(cs)
                     for attempt in range(4):
                         try:
-                            with OPENER.open(urllib.request.Request(hdr[k], data=chunk, headers=safe_headers(hdr[k], {}), method="PUT"), timeout=900) as x:
+                            pr = urllib.request.Request(hdr[k], data=chunk, headers=safe_headers(hdr[k], {}), method="PUT")
+                            with OPENER.open(pr, timeout=900) as x:
                                 etags.append({"partNumber": i + 1, "etag": x.headers["ETag"]})
                             break
                         except (urllib.error.URLError, TimeoutError):
@@ -243,6 +252,7 @@ def put(local, remote, manifest):
                 headers = safe_headers(up["href"], hdr)
                 headers["Content-Length"] = str(size)
                 r = urllib.request.Request(up["href"], data=f, headers=headers, method="PUT")
+                r.lg_scanned = True   # sha256_size() read this file and refused the token before we got here
                 with OPENER.open(r, timeout=3600) as x:
                     if x.status not in (200, 201):
                         sys.exit(f"hf.py: upload of {remote} failed {x.status}")
@@ -317,34 +327,36 @@ def main():
 
 
 def dom_sha():
-    """The sha256 Hugging Face records for domains.txt (no download); empty when absent."""
+    """The sha256 and size Hugging Face records for domains.txt (no download), tab-separated; empty when absent."""
     m = meta("domains.txt")
-    print(m[1] if m else "")
+    print(f"{m[1]}\t{m[0]}" if m else "")
     return 0
 
 
 class _Redacting:
-    """A stdout/stderr that never writes the token, whatever printed it."""
+    """A text stdout/stderr that never writes the token, whatever printed it. Holds text until a newline (or a
+    flush), so a token split across several write() calls is still seen whole. The binary side (cat's history
+    bytes, which are data for lg and not a log) is left untouched: changing verified bytes would corrupt them."""
     def __init__(self, inner):
-        self._i = inner
-        self.buffer = _RedactingBytes(inner.buffer) if hasattr(inner, "buffer") else None
-    def write(self, s): return self._i.write(redact(s))
-    def flush(self): return self._i.flush()
+        self._i, self._buf = inner, ""
+        self.buffer = getattr(inner, "buffer", None)
+    def write(self, s):
+        self._buf += s
+        if "\n" in self._buf:
+            done, self._buf = self._buf.rsplit("\n", 1)
+            self._i.write(redact(done + "\n"))
+        return len(s)
+    def flush(self):
+        if self._buf:
+            self._i.write(redact(self._buf)); self._buf = ""
+        return self._i.flush()
     def __getattr__(self, k): return getattr(self._i, k)
-
-
-class _RedactingBytes:
-    """Binary side (cat streams history bytes): the token cannot occur in our shards, but if it ever did it is cut."""
-    def __init__(self, inner): self._i = inner
-    def write(self, b):
-        t = TOKEN.encode()
-        return self._i.write(b.replace(t, b"[token]") if t and t in b else b)
-    def flush(self): return self._i.flush()
 
 
 def guarded(fn):
     """Outermost guard: whatever happens inside, nothing that leaves this process carries the token."""
-    sys.stdout, sys.stderr = _Redacting(sys.stdout), _Redacting(sys.stderr)
+    out, err = _Redacting(sys.stdout), _Redacting(sys.stderr)
+    sys.stdout, sys.stderr = out, err
     try:
         fn()
     except SystemExit as e:
@@ -355,6 +367,8 @@ def guarded(fn):
     except BaseException as e:   # an unexpected error prints its type only, never its text or traceback
         print(f"hf.py: failed: {type(e).__name__}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        out.flush(); err.flush()
 
 
 if __name__ == "__main__":

@@ -175,6 +175,48 @@ def test_plain_print_is_redacted():
     assert tok not in out and "[token]" in out
 
 
+def test_upload_of_a_file_holding_the_token_refused():
+    hf = load(); import tempfile
+    f = tempfile.NamedTemporaryFile(delete=False)
+    f.write(b"a" * ((1 << 22) - 5) + hf.TOKEN.encode() + b"tail"); f.close()   # the token straddles the 4 MB read
+    try:
+        hf.sha256_size(f.name); refused = False
+    except SystemExit:
+        refused = True
+    assert refused
+
+
+def test_unscanned_stream_refused_off_host():
+    hf = load(); b = hf._Boundary(); import tempfile
+    f = tempfile.TemporaryFile()
+    r = urllib.request.Request("https://storage.example/o", data=f, method="PUT")
+    try:
+        b._check(r); refused = False
+    except SystemExit:
+        refused = True
+    assert refused
+    r.lg_scanned = True
+    b._check(r)
+
+
+def test_token_split_across_writes_redacted():
+    def split(hf):
+        T = hf.TOKEN
+        sys.stderr.write("x " + T[:5]); sys.stderr.write(T[5:] + " y\n")
+    code, out, tok = _guard_output(split)
+    assert tok not in out and "[token]" in out
+
+
+def test_history_bytes_pass_unchanged():
+    hf = load(); body = b"LGH1" + hf.TOKEN.encode() + b"rest"
+    oid = hashlib.sha256(body).hexdigest()
+    hf.meta = lambda remote: (len(body), oid)
+    hf.req = lambda method, url, stream=False, timeout=0: (200, Reply(body))
+    got = []
+    hf.fetch("history/h-00000.bin", got.append)
+    assert b"".join(got) == body
+
+
 def _guard_output(fn):
     hf = load()
     err = io.StringIO(); keep = sys.stdout, sys.stderr

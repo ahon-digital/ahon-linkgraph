@@ -76,6 +76,13 @@ static int vget(FILE *f, uint64_t *x) {   // 1 ok, 0 clean end before the first 
 static uint64_t vneed(FILE *f) { uint64_t x; if (!vget(f, &x)) die("truncated record"); return x; }
 static int bget(FILE *f) { int c = getc(f); if (c == EOF) die("truncated record"); return c; }
 
+// The only way lg reads a text line: getline, then refuse an embedded NUL (C string code would stop at it and
+// silently drop the rest). Returns the length including any newline; -1 at end.
+static ssize_t gline(char **s, size_t *cap, FILE *f) {
+  ssize_t n = getline(s, cap, f);
+  if (n > 0 && memchr(*s, 0, (size_t)n)) die("NUL byte in a text line");
+  return n;
+}
 static uint64_t mix64(uint64_t z) {   // splitmix64 finaliser
   z += 0x9E3779B97F4A7C15ULL; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL; z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL; return z ^ (z >> 31);
 }
@@ -110,7 +117,7 @@ static void save_u32(const char *path, const uint32_t *a, uint64_t n) {
 // ---------- names ----------
 static int cmd_names(const char *out) {
   FILE *o = xopen(out, "wb"); char *line = NULL, *prev = NULL; size_t cap = 0, pcap = 0; ssize_t len; uint64_t want = 0;
-  while ((len = getline(&line, &cap, stdin)) > 0) {
+  while ((len = gline(&line, &cap, stdin)) > 0) {
     char *t1 = strchr(line, '\t'); if (!t1) die("vertex line without a tab");
     *t1 = 0; uint64_t id = num(line, UINT32_MAX, "vertex id");
     if (id != want) { fprintf(stderr, "lg: vertex id %llu where %llu expected\n", (unsigned long long)id, (unsigned long long)want); exit(3); }
@@ -130,7 +137,7 @@ static int cmd_names(const char *out) {
 typedef struct { FILE *f; char *s; size_t cap; ssize_t len; uint64_t n; } Lines;
 static int lnext(Lines *l) {
   if (!l->f) return 0;
-  l->len = getline(&l->s, &l->cap, l->f);
+  l->len = gline(&l->s, &l->cap, l->f);
   if (l->len <= 0) return 0;
   if (l->s[l->len - 1] == '\n') l->s[--l->len] = 0;
   return 1;
@@ -280,12 +287,12 @@ static void hist_put(HistOut *w, const Rec *r) {
 
 // Reads a history index: the release it was built through and how many distinct shards it lists.
 static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_t **recs, uint64_t **bytes) {
-  FILE *f = xopen(p, "rb"); char line[512]; uint64_t sh, last = UINT64_MAX, nrec = 0, v[3]; *shards = 0;
+  FILE *f = xopen(p, "rb"); char *line = NULL; size_t lcap = 0; uint64_t sh, last = UINT64_MAX, nrec = 0, v[3]; *shards = 0;
   *recs = xmalloc(8 * 64); *bytes = xmalloc(8 * 64); uint64_t cap = 64;
-  if (!fgets(line, sizeof line, f) || strncmp(line, "#release\t", 9)) die("history index has no #release line");
+  if (gline(&line, &lcap, f) <= 0 || strncmp(line, "#release\t", 9)) die("history index has no #release line");
   { size_t L = strlen(line); if (L && line[L - 1] == '\n') line[L - 1] = 0; }   /* only the newline: a \r or anything else fails num() */ *release = (int)num(line + 9, 254, "the index's release");
   const uint64_t BIG = 1ULL << 48;
-  while (fgets(line, sizeof line, f)) {
+  while (gline(&line, &lcap, f) > 0) {
     if (!strncmp(line, "#shard\t", 7)) {
       if (fields(line + 7, v, 3, BIG, "an index #shard field") != 3 || v[0] != nrec) die("bad #shard line in the history index");
       uint64_t rc = v[1], by = v[2];
@@ -372,13 +379,13 @@ typedef struct { char **s; uint64_t n; } Names;
 static Names load_names(const char *p) {
   FILE *f = xopen(p, "rb"); Names r = {0}; uint64_t cap = 1024; r.s = xmalloc(cap * sizeof(char *));
   char *line = NULL; size_t c = 0; ssize_t l;
-  while ((l = getline(&line, &c, f)) > 0) { if (line[l - 1] == '\n') line[--l] = 0; if (r.n == cap) { cap *= 2; r.s = xrealloc(r.s, cap * sizeof(char *)); } r.s[r.n++] = strdup(line); }
+  while ((l = gline(&line, &c, f)) > 0) { if (line[l - 1] == '\n') line[--l] = 0; if (r.n == cap) { cap *= 2; r.s = xrealloc(r.s, cap * sizeof(char *)); } r.s[r.n++] = strdup(line); }
   fclose(f); free(line); return r;
 }
 static int cmd_dump(const char *dir, const char *namesp) {
   Names nm = load_names(namesp); char ip[4096]; snprintf(ip, sizeof ip, "%s/history.idx", dir);
-  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, lastsh = UINT64_MAX; Rec r = {0}; char ln[512]; (void)offv; (void)ft;
-  while (fgets(ln, sizeof ln, ix)) {
+  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, lastsh = UINT64_MAX; Rec r = {0}; char *ln = NULL; size_t lncap = 0; ssize_t lnl; (void)offv; (void)ft;
+  while ((lnl = gline(&ln, &lncap, ix)) > 0) {
     if (ln[0] == '#') continue;
     { uint64_t v[3]; if (fields(ln, v, 3, 1ULL << 48, "an index field") != 3) die("bad history index line"); sh = v[0]; offv = v[1]; ft = v[2]; }
     if (sh == lastsh) continue; lastsh = sh;
@@ -404,8 +411,8 @@ static int cmd_lookup(const char *dir, const char *namesp, const char *domain) {
   uint64_t lo = 0, hi = nm.n; while (lo < hi) { uint64_t m = (lo + hi) / 2; if (strcmp(nm.s[m], rv) < 0) lo = m + 1; else hi = m; }
   if (lo >= nm.n || strcmp(nm.s[lo], rv)) { printf("{\"domain\": \"%s\", \"known\": false}\n", domain); return 0; }
   uint64_t id = lo; char ip[4096]; snprintf(ip, sizeof ip, "%s/history.idx", dir);
-  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, bsh = UINT64_MAX, boff = 0; char ln[512];
-  while (fgets(ln, sizeof ln, ix)) {
+  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, bsh = UINT64_MAX, boff = 0; char *ln = NULL; size_t lncap = 0; ssize_t lnl;
+  while ((lnl = gline(&ln, &lncap, ix)) > 0) {
     if (ln[0] == '#') continue;
     { uint64_t v[3]; if (fields(ln, v, 3, 1ULL << 48, "an index field") != 3) die("bad history index line"); sh = v[0]; offv = v[1]; ft = v[2]; }
     if (ft > id) break; bsh = sh; boff = offv;
@@ -430,6 +437,10 @@ int main(int argc, char **argv) {
   if (argc == 7 && !strcmp(argv[1], "dictmerge")) return cmd_dictmerge(argv[2], argv[3], argv[4], argv[5], argv[6]);
   if (argc == 7 && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6]);
   if ((argc == 9 || argc == 10) && !strcmp(argv[1], "merge")) return cmd_merge((int)num(argv[2], 254, "REL_INDEX"), argv[3], argv[4], argv[5], argv[6], argv[7], num(argv[8], 1ULL << 24, "SHARD_KB"), argc == 10 ? argv[9] : NULL);
+  if (argc == 3 && !strcmp(argv[1], "checkidx")) {   // full validation of a history index; prints its release
+    int rel; uint64_t sh, *rc, *by; read_idx_head(argv[2], &rel, &sh, &rc, &by);
+    printf("%d\n", rel); return 0;
+  }
   if (argc == 4 && !strcmp(argv[1], "dump")) return cmd_dump(argv[2], argv[3]);
   if (argc == 5 && !strcmp(argv[1], "lookup")) return cmd_lookup(argv[2], argv[3], argv[4]);
   fprintf(stderr, "usage: see the header of lg.c\n"); return 2;

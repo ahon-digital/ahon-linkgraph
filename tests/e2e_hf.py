@@ -96,6 +96,16 @@ try:
     open(f"{T}/other_domains.txt", "w").write("com.aaaa\ncom.zzzz\n"); man0 = f"{T}/dom.manifest"
     subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "put", f"{T}/other_domains.txt", "domains.txt", man0], env=env, check=True, capture_output=True)
     subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "commit", "e2e: swap the domain list", man0], env=env, check=True, capture_output=True)
+    # a history index with a junk line, while current, must stop the run (full index check, no download)
+    open(f"{T}/bad.idx", "wb").write(idx + b"NOT AN INDEX\n"); manb = f"{T}/badidx.manifest"
+    subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "put", f"{T}/bad.idx", "history/history.idx", manb], env=env, check=True, capture_output=True)
+    subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "commit", "e2e: junk in the index", manb], env=env, check=True, capture_output=True)
+    p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=f"{T}/junkidx"), capture_output=True, text=True)
+    if p.returncode == 0:
+        fails.append("junk line in the history index not refused while current")
+    open(f"{T}/good.idx", "wb").write(idx); mang = f"{T}/goodidx.manifest"            # put the real index back
+    subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "put", f"{T}/good.idx", "history/history.idx", mang], env=env, check=True, capture_output=True)
+    subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "commit", "e2e: restore the index", mang], env=env, check=True, capture_output=True)
     # the history is current here (no next release): the check must still run before "nothing to do"
     p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=f"{T}/swapdom"), capture_output=True, text=True)
     if p.returncode == 0 or "not the list the last release recorded" not in p.stdout:
