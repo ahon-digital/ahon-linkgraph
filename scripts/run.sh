@@ -10,6 +10,8 @@ LG="$here/../lg"
 W=${LG_WORK:-/tmp/lg-work}
 SHARD_KB=${LG_SHARD_KB:-524288}
 CC=${LG_CC_BASE:-https://data.commoncrawl.org/projects/hyperlinkgraph}
+# these paths are pasted into commands lg runs; plain characters only
+for p in "$here" "$W"; do case "$p" in *[!A-Za-z0-9/_.-]*) echo "unsafe path: $p"; exit 1;; esac; done
 mkdir -p "$W"; cd "$W"
 log() { echo "== $(date -u +%FT%TZ) $*"; }
 
@@ -49,12 +51,13 @@ rm -f map_rel.u32
 
 log "merge into history"
 rm -rf hist manifest.tsv; mkdir hist; : > manifest.tsv
-if [ "$RI" = 0 ]; then PREV=-; else
+if [ "$RI" = 0 ]; then PREV=-; PREVIDX=-; else
   python3 "$here/hf.py" get history/history.idx prev.idx
-  PREV="python3 '$here/hf.py' cat $(cut -f1 prev.idx | uniq | awk '{printf "history/h-%05d.bin ", $1}')"
+  PREVIDX=prev.idx
+  PREV="python3 '$here/hf.py' cat $(grep -v '^#' prev.idx | cut -f1 | uniq | awk '{printf "history/h-%05d.bin ", $1}')"
 fi
 if [ "${LG_DRY:-0}" = 1 ]; then HOOK="true"; else HOOK="sh -c 'python3 \"$here/hf.py\" put \"\$0\" history/\$(basename \"\$0\") manifest.tsv && rm -f \"\$0\"'"; fi
-"$LG" merge "$RI" "$PREV" map_old.u32 rel.bin hist "$SHARD_KB" "$HOOK" | tee merge.json
+"$LG" merge "$RI" "$PREV" "$PREVIDX" map_old.u32 rel.bin hist "$SHARD_KB" "$HOOK" | tee merge.json
 rm -f map_old.u32 rel.bin
 
 if [ "${LG_DRY:-0}" = 1 ]; then log "dry run: built $(ls hist | wc -l) files, uploaded nothing"; du -sh hist; exit 0; fi

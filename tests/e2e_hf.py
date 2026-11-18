@@ -56,12 +56,14 @@ try:
     # download what was published and compare
     H = "https://huggingface.co"
     hdr = {"Authorization": "Bearer " + os.environ["HF_TOKEN"]}
-    def get(path):
-        return urllib.request.urlopen(urllib.request.Request(f"{H}/datasets/{REPO}/resolve/main/{path}", headers=hdr), timeout=120).read()
+    def get(path):   # through hf.py, so the token never follows a redirect off huggingface.co
+        out = f"{T}/dl.bin"
+        subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "get", path, out], env=env, check=True, capture_output=True)
+        return open(out, "rb").read()
     d = T + "/pub/history"; os.makedirs(d)
     idx = get("history/history.idx")
     open(d + "/history.idx", "wb").write(idx)
-    for sh in sorted({int(l.split(b"\t")[0]) for l in idx.splitlines()}):
+    for sh in sorted({int(l.split(b"\t")[0]) for l in idx.splitlines() if not l.startswith(b"#")}):
         open(f"{d}/h-{sh:05d}.bin", "wb").write(get(f"history/h-{sh:05d}.bin"))
     open(T + "/pub/domains.txt", "wb").write(get("domains.txt"))
     rel = get("releases.tsv").decode().splitlines()

@@ -23,14 +23,29 @@ if not TOKEN or not REPO:
 ORG, NAME = REPO.split("/", 1)
 
 
+def _hf(url):
+    return (urllib.parse.urlsplit(url).hostname or "") == "huggingface.co"
+
+
+class _Redirect(urllib.request.HTTPRedirectHandler):
+    """Follows redirects, but the token never leaves huggingface.co: a hop to any other host drops it."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and not _hf(newurl):
+            new.remove_header("Authorization")
+        return new
+
+
+OPENER = urllib.request.build_opener(_Redirect)
+
+
 def req(method, url, data=None, headers=None, stream=False, timeout=300, tries=4):
     # The token goes to huggingface.co only, never to an address taken from a reply that points elsewhere.
-    host = urllib.parse.urlsplit(url).hostname or ""
-    h = {"Authorization": "Bearer " + TOKEN} if host == "huggingface.co" else {}
+    h = {"Authorization": "Bearer " + TOKEN} if _hf(url) else {}
     h.update(headers or {})
     for attempt in range(tries):
         try:
-            r = urllib.request.urlopen(urllib.request.Request(url, data=data, headers=h, method=method), timeout=timeout)
+            r = OPENER.open(urllib.request.Request(url, data=data, headers=h, method=method), timeout=timeout)
             if stream:
                 return r.status, r
             body = r.read()
@@ -68,21 +83,56 @@ def resolve_url(remote):
     return f"{H}/datasets/{REPO}/resolve/main/{remote}"
 
 
-def get(remote, out):
+_META = {}
+
+
+def meta(remote):
+    """(size, sha256) the repo records for a file; None if the file does not exist. A download is only accepted when
+    it matches both: a connection that closes early is an error, never a shorter file."""
+    folder = remote.rsplit("/", 1)[0] if "/" in remote else ""
+    if folder not in _META:
+        st, b = req("GET", f"{H}/api/datasets/{REPO}/tree/main/{folder}")
+        if st == 404:
+            _META[folder] = {}
+        elif st != 200:
+            sys.exit(f"hf.py: listing {folder or '/'} failed {st}")
+        else:
+            _META[folder] = {x["path"]: (x.get("lfs") or {}).get("size", x.get("size")) for x in jsonbody(b) if x.get("type") == "file"}
+            _META[folder + "#oid"] = {x["path"]: (x.get("lfs") or {}).get("oid") for x in jsonbody(b) if x.get("type") == "file"}
+    if remote not in _META[folder]:
+        return None
+    return _META[folder][remote], _META[folder + "#oid"][remote]
+
+
+def fetch(remote, sink):
+    m = meta(remote)
+    if m is None:
+        return 404
+    size, oid = m
     st, r = req("GET", resolve_url(remote), stream=True, timeout=600)
-    if st == 404:
-        return 3
-    if st not in (200,):
+    if st != 200:
         sys.exit(f"hf.py: get {remote} failed {st}")
-    n = 0
-    with open(out + ".part", "wb") as f:
-        while True:
-            c = r.read(1 << 22)
-            if not c:
-                break
-            f.write(c)
-            n += len(c)
+    h, n = hashlib.sha256(), 0
+    while True:
+        c = r.read(1 << 22)
+        if not c:
+            break
+        h.update(c)
+        n += len(c)
+        sink(c)
     r.close()
+    if n != size or (oid and h.hexdigest() != oid):
+        sys.exit(f"hf.py: {remote} arrived incomplete or changed ({n} of {size} bytes)")
+    return 200
+
+
+def get(remote, out):
+    with open(out + ".part", "wb") as f:
+        st = fetch(remote, f.write)
+    if st == 404:
+        os.remove(out + ".part")
+        return 3
+    n = os.path.getsize(out + ".part")
     os.replace(out + ".part", out)
     print(json.dumps({"got": remote, "bytes": n}), file=sys.stderr)
     return 0
@@ -91,15 +141,8 @@ def get(remote, out):
 def cat(remotes):
     out = sys.stdout.buffer
     for remote in remotes:
-        st, r = req("GET", resolve_url(remote), stream=True, timeout=600)
-        if st != 200:
-            sys.exit(f"hf.py: cat {remote} failed {st}")
-        while True:
-            c = r.read(1 << 22)
-            if not c:
-                break
-            out.write(c)
-        r.close()
+        if fetch(remote, out.write) != 200:
+            sys.exit(f"hf.py: {remote} is missing")
     out.flush()
     return 0
 
@@ -140,7 +183,7 @@ def put(local, remote, manifest):
                     chunk = f.read(cs)
                     for attempt in range(4):
                         try:
-                            with urllib.request.urlopen(urllib.request.Request(hdr[k], data=chunk, method="PUT"), timeout=900) as x:
+                            with OPENER.open(urllib.request.Request(hdr[k], data=chunk, method="PUT"), timeout=900) as x:
                                 etags.append({"partNumber": i + 1, "etag": x.headers["ETag"]})
                             break
                         except (urllib.error.URLError, TimeoutError):
@@ -155,7 +198,7 @@ def put(local, remote, manifest):
                 headers = dict(hdr)
                 headers["Content-Length"] = str(size)
                 r = urllib.request.Request(up["href"], data=f, headers=headers, method="PUT")
-                with urllib.request.urlopen(r, timeout=3600) as x:
+                with OPENER.open(r, timeout=3600) as x:
                     if x.status not in (200, 201):
                         sys.exit(f"hf.py: upload of {remote} failed {x.status}")
         if "verify" in act:

@@ -1,20 +1,71 @@
 #!/usr/bin/env python3
-"""hf.py sends the token to huggingface.co only: never to storage addresses or look-alike hosts. No network."""
-import importlib.util, os, sys, urllib.request
+"""hf.py, no network: the token reaches huggingface.co only (first request and every redirect hop), and a download
+is accepted only when its size and sha256 match what the repo records.
 
-os.environ.update(HF_TOKEN="hf_test_value", LG_REPO="org/name")
-spec = importlib.util.spec_from_file_location("hf", os.path.join(os.path.dirname(__file__), "..", "scripts", "hf.py"))
-hf = importlib.util.module_from_spec(spec); spec.loader.exec_module(hf)
-seen = []
+    python3 tests/test_hf_token.py        or        pytest tests/test_hf_token.py
+"""
+import hashlib, importlib.util, io, os, sys, urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load():
+    os.environ.update(HF_TOKEN="hf_test_value", LG_REPO="org/name")
+    spec = importlib.util.spec_from_file_location("hf", os.path.join(HERE, "..", "scripts", "hf.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
 class Reply:
-    status = 200
-    def read(self): return b"{}"
+    def __init__(self, body=b"{}", status=200):
+        self.status, self._b = status, io.BytesIO(body)
+    def read(self, n=-1): return self._b.read(n)
     def close(self): pass
-urllib.request.urlopen = lambda r, timeout=0: (seen.append((r.full_url, r.get_header("Authorization"))), Reply())[1]
-cases = {"https://huggingface.co/api/x": True, "https://s3.us-east-1.amazonaws.com/b/x": False,
-         "https://huggingface.co.evil.example/x": False, "http://cas-bridge.xethub.hf.co/x": False}
-for url in cases:
-    hf.req("POST", url)
-bad = [(u, a) for (u, a), want in zip(seen, cases.values()) if bool(a) != want]
-print(f"{len(cases)} checks, {len(bad)} failed")
-sys.exit(1 if bad else 0)
+
+
+def test_first_request_scoping():
+    hf = load(); seen = []
+    hf.OPENER.open = lambda r, timeout=0: (seen.append((r.full_url, r.get_header("Authorization"))), Reply())[1]
+    cases = {"https://huggingface.co/api/x": True, "https://s3.us-east-1.amazonaws.com/b/x": False,
+             "https://huggingface.co.evil.example/x": False, "http://cas-bridge.xethub.hf.co/x": False}
+    for url in cases:
+        hf.req("POST", url)
+    assert [bool(a) for _, a in seen] == list(cases.values())
+
+
+def test_redirect_drops_token_off_huggingface():
+    hf = load(); h = hf._Redirect()
+    r = urllib.request.Request("https://huggingface.co/datasets/org/name/resolve/main/x", headers={"Authorization": "Bearer t"})
+    off = h.redirect_request(r, None, 302, "Found", {}, "https://storage.example/object")
+    same = h.redirect_request(r, None, 302, "Found", {}, "https://huggingface.co/other")
+    assert off is not None and not off.has_header("Authorization") and "Authorization" not in off.unredirected_hdrs
+    assert same is not None and same.get_header("Authorization") == "Bearer t"
+
+
+def test_download_must_match_size_and_hash():
+    hf = load(); body = b"0123456789abcdef"
+    oid = hashlib.sha256(body).hexdigest()
+    hf.meta = lambda remote: (len(body), oid)
+    for served, ok in ((body, True), (body[:9], False), (body[:-1] + b"X", False)):
+        hf.req = lambda method, url, stream=False, timeout=0, s=served: (200, Reply(s))
+        got = []
+        try:
+            hf.fetch("history/h-00000.bin", got.append)
+            accepted = True
+        except SystemExit:
+            accepted = False
+        assert accepted == ok, (served, accepted)
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    bad = 0
+    for t in tests:
+        try:
+            t()
+        except AssertionError as e:
+            bad += 1
+            print("FAIL", t.__name__, e)
+    print(f"{len(tests)} checks, {bad} failed")
+    sys.exit(1 if bad else 0)

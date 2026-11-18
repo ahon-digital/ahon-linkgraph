@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """lg against a plain-Python reference. Standard library only.
 
-    python3 tests/test_lg.py path/to/lg        exit 0 = every check passed
+    python3 tests/test_lg.py [path/to/lg]      exit 0 = every check passed (builds lg itself when no path is given)
+    pytest tests/test_lg.py                     same, as one test
 
 Builds four synthetic releases whose domains overlap and drift (names come and go, links appear, vanish and return),
 runs the real pipeline (names -> dictmerge -> inbound -> merge) release by release with tiny shards, and compares
@@ -9,10 +10,33 @@ every link's first and last release with the reference. Then checks that bad inp
 """
 import os, random, shutil, subprocess, sys, tempfile
 
-LG = os.path.abspath(sys.argv[1])
-random.seed(11)
-W = tempfile.mkdtemp(prefix="lg-test-")
-fails, checks = [], 0
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def build():
+    out = os.path.join(tempfile.mkdtemp(prefix="lg-bin-"), "lg")
+    subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", "-o", out, os.path.join(ROOT, "src", "lg.c")], check=True)
+    return out
+
+
+def main(lg):
+    global LG, W, fails, checks
+    LG = os.path.abspath(lg)
+    random.seed(11)
+    W = tempfile.mkdtemp(prefix="lg-test-")
+    fails, checks = [], 0
+    try:
+        body()
+    finally:
+        shutil.rmtree(W, ignore_errors=True)
+    print(f"{checks} checks, {len(fails)} failed")
+    for f in fails:
+        print("FAIL", f)
+    return fails
+
+
+def test_lg():
+    assert main(build()) == []
 
 
 def run(*args, ok=True, stdin=None):
@@ -29,100 +53,130 @@ def check(name, cond, detail=""):
         fails.append(f"{name} {detail}".strip())
 
 
-tlds = ["com", "org", "net", "co.uk", "io", "de"]
-universe = sorted({f"{random.choice(tlds)}.{''.join(random.choices('abcdefghij', k=random.randint(2, 7)))}".replace("co.uk.", "uk.co.") for _ in range(900)})
-releases = []
-for r in range(4):
-    names = sorted(random.sample(universe, random.randint(350, 600)))
-    n = len(names)
-    edges = set()
-    for _ in range(random.randint(2500, 4500)):
-        a = random.randrange(n)
-        b = int(random.paretovariate(1.1)) % n if random.random() < 0.5 else random.randrange(n)
-        if a != b:
-            edges.add((a, b))
-    releases.append((names, sorted(edges)))
 
-ref = {}   # (target name, source name) -> [first, last]
-prev_dir, prev_global = None, None
-for ri, (names, edges) in enumerate(releases):
-    d = os.path.join(W, f"r{ri}"); os.makedirs(d)
-    vtx = "".join(f"{i}\t{nm}\t1\n" for i, nm in enumerate(names))
-    with open(f"{d}/edges.txt", "w") as f:
-        f.write("".join(f"{a}\t{b}\n" for a, b in edges))
-    run("names", f"{d}/names.txt", stdin=vtx)
-    run("dictmerge", prev_global or "-", f"{d}/names.txt", f"{d}/global.txt", f"{d}/map_old.u32", f"{d}/map_rel.u32")
-    run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/rel.bin", f"cat {d}/edges.txt")
-    hd = f"{d}/hist"; os.makedirs(hd)
-    prevcmd = f"cat {prev_dir}/h-*.bin" if prev_dir else "-"
-    run("merge", str(ri), prevcmd, f"{d}/map_old.u32", f"{d}/rel.bin", hd, "2")
-    for a, b in edges:
-        k = (names[b], names[a])
-        if k in ref:
-            ref[k][1] = ri
-        else:
-            ref[k] = [ri, ri]
-    prev_dir, prev_global = hd, f"{d}/global.txt"
+def body():
+    global LG, W
 
-shards = len([x for x in os.listdir(prev_dir) if x.startswith("h-")])
-check("several shards", shards >= 3, f"({shards})")
-gl = open(prev_global).read().split("\n")[:-1]
-check("global names = union", gl == sorted(set(n for nm, _ in releases for n in nm)))
-dump = run("dump", prev_dir, prev_global).stdout.splitlines()
-got = {}
-for line in dump:
-    t, s, f1, l1 = line.split("\t")
-    got[(t, s)] = [int(f1), int(l1)]
-check("every link with first and last", got == ref, f"(got {len(got)}, want {len(ref)}, diff {len(set((k, tuple(v)) for k, v in got.items()) ^ set((k, tuple(v)) for k, v in ref.items()))})")
-check("dump rows unique", len(dump) == len(got))
+    tlds = ["com", "org", "net", "co.uk", "io", "de"]
+    universe = sorted({f"{random.choice(tlds)}.{''.join(random.choices('abcdefghij', k=random.randint(2, 7)))}".replace("co.uk.", "uk.co.") for _ in range(900)})
+    releases = []
+    for r in range(4):
+        names = sorted(random.sample(universe, random.randint(350, 600)))
+        n = len(names)
+        edges = set()
+        for _ in range(random.randint(2500, 4500)):
+            a = random.randrange(n)
+            b = int(random.paretovariate(1.1)) % n if random.random() < 0.5 else random.randrange(n)
+            if a != b:
+                edges.add((a, b))
+        releases.append((names, sorted(edges)))
 
-# lookup reference reader on a few domains, including one never linked to and one unknown
-for nm in random.sample(gl, 25) + ["zz.never-seen"]:
-    dom = ".".join(reversed(nm.split(".")))
-    out = run("lookup", prev_dir, prev_global, dom).stdout.splitlines()
-    want = sorted((s, f1, l1) for (t, s), (f1, l1) in ref.items() if t == nm)
-    rows = sorted((x.split("\t")[0], int(x.split("\t")[1]), int(x.split("\t")[2])) for x in out[1:])
-    check("lookup " + dom, rows == want, f"({len(rows)} vs {len(want)})")
+    ref = {}   # (target name, source name) -> [first, last]
+    prev_dir, prev_global = None, None
+    for ri, (names, edges) in enumerate(releases):
+        d = os.path.join(W, f"r{ri}"); os.makedirs(d)
+        vtx = "".join(f"{i}\t{nm}\t1\n" for i, nm in enumerate(names))
+        with open(f"{d}/edges.txt", "w") as f:
+            f.write("".join(f"{a}\t{b}\n" for a, b in edges))
+        run("names", f"{d}/names.txt", stdin=vtx)
+        run("dictmerge", prev_global or "-", f"{d}/names.txt", f"{d}/global.txt", f"{d}/map_old.u32", f"{d}/map_rel.u32")
+        run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/rel.bin", f"cat {d}/edges.txt")
+        hd = f"{d}/hist"; os.makedirs(hd)
+        prevcmd = f"cat {prev_dir}/h-*.bin" if prev_dir else "-"
+        previdx = f"{prev_dir}/history.idx" if prev_dir else "-"
+        run("merge", str(ri), prevcmd, previdx, f"{d}/map_old.u32", f"{d}/rel.bin", hd, "2")
+        for a, b in edges:
+            k = (names[b], names[a])
+            if k in ref:
+                ref[k][1] = ri
+            else:
+                ref[k] = [ri, ri]
+        prev_dir, prev_global = hd, f"{d}/global.txt"
 
-# on-shard hook: each closed shard is handed off (moved away) and the result is unchanged
-d = os.path.join(W, "r3"); hook = f"{W}/hook.sh"; os.makedirs(f"{W}/moved/hist")
-open(hook, "w").write(f"#!/bin/sh\nmv \"$1\" {W}/moved/hist/ && echo \"$1\" >> {W}/hooked.txt\n"); os.chmod(hook, 0o755)
-os.makedirs(f"{W}/hooked")
-run("merge", "3", f"cat {W}/r2/hist/h-*.bin", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/hooked", "2", hook)
-shutil.copy(f"{W}/hooked/history.idx", f"{W}/moved/hist/history.idx")
-left = [x for x in os.listdir(f"{W}/hooked") if x.startswith("h-")]
-moved = run("dump", f"{W}/moved/hist", prev_global).stdout.splitlines()
-check("on-shard hook leaves no shard on disk", not left, str(left[:3]))
-check("on-shard hook result identical", moved == dump)
-check("hook ran once per shard", len(open(f"{W}/hooked.txt").read().split()) == shards)
-bad = f"{W}/badhook.sh"; open(bad, "w").write("#!/bin/sh\nexit 1\n"); os.chmod(bad, 0o755); os.makedirs(f"{W}/badhook")
-r = run("merge", "3", f"cat {W}/r2/hist/h-*.bin", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/badhook", "2", bad, ok=False)
-check("failing hook stops the merge", r.returncode != 0)
+    shards = len([x for x in os.listdir(prev_dir) if x.startswith("h-")])
+    check("several shards", shards >= 3, f"({shards})")
+    gl = open(prev_global).read().split("\n")[:-1]
+    check("global names = union", gl == sorted(set(n for nm, _ in releases for n in nm)))
+    dump = run("dump", prev_dir, prev_global).stdout.splitlines()
+    got = {}
+    for line in dump:
+        t, s, f1, l1 = line.split("\t")
+        got[(t, s)] = [int(f1), int(l1)]
+    check("every link with first and last", got == ref, f"(got {len(got)}, want {len(ref)}, diff {len(set((k, tuple(v)) for k, v in got.items()) ^ set((k, tuple(v)) for k, v in ref.items()))})")
+    check("dump rows unique", len(dump) == len(got))
 
-# refusals
-r = run("names", f"{W}/bad.txt", ok=False, stdin="0\tcom.b\t1\n1\tcom.a\t1\n")
-check("unsorted names refused", r.returncode != 0)
-r = run("names", f"{W}/bad.txt", ok=False, stdin="0\tcom.a\t1\n2\tcom.b\t1\n")
-check("skipped id refused", r.returncode != 0)
-d = os.path.join(W, "r3")
-names, edges = releases[3]
-r = run("inbound", str(len(names)), str(len(edges) + 1), f"{d}/map_rel.u32", f"{W}/x.bin", f"cat {d}/edges.txt", ok=False)
-check("wrong edge count refused", r.returncode != 0)
-flip = f"{W}/flip.sh"
-open(flip, "w").write(f"#!/bin/sh\nif [ -e {W}/once ]; then awk -F'\\t' 'NR==1{{$2=($2==0?1:0)}} {{print $1\"\\t\"$2}}' {d}/edges.txt; else touch {W}/once; cat {d}/edges.txt; fi\n")
-os.chmod(flip, 0o755)
-r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{W}/x.bin", flip, ok=False)
-check("second pass differing refused", r.returncode != 0, r.stderr.strip()[:80])
-os.makedirs(f"{W}/again")
-r = run("merge", "3", f"cat {prev_dir}/h-*.bin", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/again", "2", ok=False)
-check("same release twice refused", r.returncode != 0)
-unsorted_edges = f"{W}/unsorted.txt"
-open(unsorted_edges, "w").write("".join(f"{a}\t{b}\n" for a, b in reversed(edges)))
-r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{W}/x.bin", f"cat {unsorted_edges}", ok=False)
-check("edges not sorted by source refused", r.returncode != 0)
+    # lookup reference reader on a few domains, including one never linked to and one unknown
+    for nm in random.sample(gl, 25) + ["zz.never-seen"]:
+        dom = ".".join(reversed(nm.split(".")))
+        out = run("lookup", prev_dir, prev_global, dom).stdout.splitlines()
+        want = sorted((s, f1, l1) for (t, s), (f1, l1) in ref.items() if t == nm)
+        rows = sorted((x.split("\t")[0], int(x.split("\t")[1]), int(x.split("\t")[2])) for x in out[1:])
+        check("lookup " + dom, rows == want, f"({len(rows)} vs {len(want)})")
 
-print(f"{checks} checks, {len(fails)} failed, {len(ref)} links, {len(gl)} domains, {shards} shards")
-for f in fails:
-    print("FAIL", f)
-shutil.rmtree(W)
-sys.exit(1 if fails else 0)
+    # on-shard hook: each closed shard is handed off (moved away) and the result is unchanged
+    d = os.path.join(W, "r3"); hook = f"{W}/hook.sh"; os.makedirs(f"{W}/moved/hist")
+    open(hook, "w").write(f"#!/bin/sh\nmv \"$1\" {W}/moved/hist/ && echo \"$1\" >> {W}/hooked.txt\n"); os.chmod(hook, 0o755)
+    os.makedirs(f"{W}/hooked")
+    run("merge", "3", f"cat {W}/r2/hist/h-*.bin", f"{W}/r2/hist/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/hooked", "2", hook)
+    shutil.copy(f"{W}/hooked/history.idx", f"{W}/moved/hist/history.idx")
+    left = [x for x in os.listdir(f"{W}/hooked") if x.startswith("h-")]
+    moved = run("dump", f"{W}/moved/hist", prev_global).stdout.splitlines()
+    check("on-shard hook leaves no shard on disk", not left, str(left[:3]))
+    check("on-shard hook result identical", moved == dump)
+    check("hook ran once per shard", len(open(f"{W}/hooked.txt").read().split()) == shards)
+    bad = f"{W}/badhook.sh"; open(bad, "w").write("#!/bin/sh\nexit 1\n"); os.chmod(bad, 0o755); os.makedirs(f"{W}/badhook")
+    r = run("merge", "3", f"cat {W}/r2/hist/h-*.bin", f"{W}/r2/hist/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/badhook", "2", bad, ok=False)
+    check("failing hook stops the merge", r.returncode != 0)
+
+    # refusals
+    r = run("names", f"{W}/bad.txt", ok=False, stdin="0\tcom.b\t1\n1\tcom.a\t1\n")
+    check("unsorted names refused", r.returncode != 0)
+    r = run("names", f"{W}/bad.txt", ok=False, stdin="0\tcom.a\t1\n2\tcom.b\t1\n")
+    check("skipped id refused", r.returncode != 0)
+    d = os.path.join(W, "r3")
+    names, edges = releases[3]
+    r = run("inbound", str(len(names)), str(len(edges) + 1), f"{d}/map_rel.u32", f"{W}/x.bin", f"cat {d}/edges.txt", ok=False)
+    check("wrong edge count refused", r.returncode != 0)
+    flip = f"{W}/flip.sh"
+    open(flip, "w").write(f"#!/bin/sh\nif [ -e {W}/once ]; then awk -F'\\t' 'NR==1{{$2=($2==0?1:0)}} {{print $1\"\\t\"$2}}' {d}/edges.txt; else touch {W}/once; cat {d}/edges.txt; fi\n")
+    os.chmod(flip, 0o755)
+    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{W}/x.bin", flip, ok=False)
+    check("second pass differing refused", r.returncode != 0, r.stderr.strip()[:80])
+    os.makedirs(f"{W}/again")
+    r = run("merge", "3", f"cat {prev_dir}/h-*.bin", f"{prev_dir}/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/again", "2", ok=False)
+    check("same release twice refused", r.returncode != 0)
+    # review findings, 18 Nov
+    r2 = f"{W}/r2/hist"; n2 = len([x for x in os.listdir(r2) if x.startswith("h-")])
+    for ri_bad in ("2", "4", "0"):
+        os.makedirs(f"{W}/ri{ri_bad}")
+        r = run("merge", ri_bad, f"cat {r2}/h-*.bin", f"{r2}/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/ri{ri_bad}", "2", ok=False)
+        check(f"release index {ri_bad} after 2 refused", r.returncode != 0)
+    os.makedirs(f"{W}/missing")
+    last = sorted(x for x in os.listdir(r2) if x.startswith("h-"))[-1]
+    r = run("merge", "3", f"ls {r2}/h-*.bin | grep -v {last} | xargs cat", f"{r2}/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/missing", "2", ok=False)
+    check("missing last shard refused", r.returncode != 0, r.stderr.strip()[:80])
+    os.makedirs(f"{W}/short")
+    r = run("merge", "3", f"cat {r2}/h-*.bin | head -c $(( $(cat {r2}/h-*.bin | wc -c) - 7 ))", f"{r2}/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/short", "2", ok=False)
+    check("cut-off history refused", r.returncode != 0, r.stderr.strip()[:80])
+    q = f"{W}/hist'; true; : '"; os.makedirs(q)
+    r = run("merge", "3", f"cat {r2}/h-*.bin", f"{r2}/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", q, "2", "false", ok=False)
+    check("quote in path cannot hide a failing hook", r.returncode != 0)
+    ident = f"{W}/ident17.u32"; open(ident, "wb").write(b"".join(i.to_bytes(4, "little") for i in range(17)))
+    open(f"{W}/p1.txt", "w").write("4\t0\n16\t0\n"); open(f"{W}/p2.txt", "w").write("8\t0\n12\t0\n")
+    alt = f"{W}/alt.sh"; open(alt, "w").write(f"#!/bin/sh\nif [ -e {W}/alt1 ]; then cat {W}/p2.txt; else touch {W}/alt1; cat {W}/p1.txt; fi\n"); os.chmod(alt, 0o755)
+    r = run("inbound", "17", "2", ident, f"{W}/c.bin", alt, ok=False)
+    check("reviewer's fingerprint collision refused", r.returncode != 0, r.stderr.strip()[:80])
+    open(f"{W}/p3.txt", "w").write("4\t1\n8\t5\n"); open(f"{W}/p4.txt", "w").write("8\t5\n4\t1\n")
+    alt2 = f"{W}/alt2.sh"; open(alt2, "w").write(f"#!/bin/sh\nif [ -e {W}/alt2f ]; then cat {W}/p4.txt; else touch {W}/alt2f; cat {W}/p3.txt; fi\n"); os.chmod(alt2, 0o755)
+    r = run("inbound", "17", "2", ident, f"{W}/c.bin", alt2, ok=False)
+    check("second pass out of order refused", r.returncode != 0)
+    unsorted_edges = f"{W}/unsorted.txt"
+    open(unsorted_edges, "w").write("".join(f"{a}\t{b}\n" for a, b in reversed(edges)))
+    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{W}/x.bin", f"cat {unsorted_edges}", ok=False)
+    check("edges not sorted by source refused", r.returncode != 0)
+
+    print(f"{len(ref)} links, {len(gl)} domains, {shards} shards")
+
+
+if __name__ == "__main__":
+    sys.exit(1 if main(sys.argv[1] if len(sys.argv) > 1 else build()) else 0)

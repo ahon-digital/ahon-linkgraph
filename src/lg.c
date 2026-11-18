@@ -10,9 +10,11 @@
 //   lg inbound N E MAP_REL OUT CMD  Runs CMD twice (it must print the release's "from<TAB>to" edges, sorted by from).
 //                                   Pass 1 counts, pass 2 places: "who links to X" in ~8 bytes a node + 4 a link.
 //                                   OUT: records (target, count, sources) in global ids, targets ascending.
-//   lg merge REL_INDEX PREVCMD|- MAP_OLD REL OUTDIR SHARD_KB [ON_SHARD]
+//   lg merge REL_INDEX PREVCMD|- PREVIDX|- MAP_OLD REL OUTDIR SHARD_KB [ON_SHARD]
 //                                   Folds a release (lg inbound OUT) into the history. PREVCMD prints the previous
-//                                   history's shards in order. Writes OUTDIR/h-NNNNN.bin + OUTDIR/history.idx. If
+//                                   history's shards in order; PREVIDX is that history's index. REL_INDEX must be
+//                                   exactly one past the release PREVIDX records (0 with no history), and every shard
+//                                   PREVIDX lists must arrive whole, or the merge stops. Writes OUTDIR/h-NNNNN.bin + OUTDIR/history.idx. If
 //                                   ON_SHARD is given, it runs as "ON_SHARD <path>" after each shard closes (upload it,
 //                                   delete it), so the disk never holds the whole history; a failure stops the merge.
 //   lg dump DIR NAMES               Every link as "target<TAB>source<TAB>first<TAB>last" (tests).
@@ -20,7 +22,8 @@
 //
 // History shard: "LGH1", u64 record count, records. Record: varint target (absolute global id), varint count, then
 // count x (varint source delta, first-release byte, last-release byte); the first source delta is the absolute id.
-// history.idx: "shard<TAB>offset<TAB>first_target" at every shard start and about every 1 MB, for range reads.
+// history.idx: first line "#release<TAB>N" (the last release folded in), then "shard<TAB>offset<TAB>first_target" at
+// every shard start and about every 1 MB, for range reads.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +52,12 @@ static int vget(FILE *f, uint64_t *x) {   // 1 ok, 0 clean end before the first 
 static uint64_t vneed(FILE *f) { uint64_t x; if (!vget(f, &x)) die("truncated record"); return x; }
 static int bget(FILE *f) { int c = getc(f); if (c == EOF) die("truncated record"); return c; }
 
+static uint64_t mix64(uint64_t z) {   // splitmix64 finaliser
+  z += 0x9E3779B97F4A7C15ULL; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL; z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL; return z ^ (z >> 31);
+}
+// Order-dependent fingerprint of the edge stream: two independent chained 64-bit lanes. A second pass must equal the
+// first edge for edge, in the same order.
+static void fp_add(uint64_t h[2], uint64_t a, uint64_t b) { uint64_t e = (a << 32) | b; h[0] = mix64(h[0] ^ e); h[1] = mix64(h[1] + mix64(e ^ 0xD6E8FEB86659FD93ULL)); }
 static int rdu(FILE *f, uint64_t *x) {    // next unsigned integer in text; 0 at end
   int c; do { c = getc_unlocked(f); if (c == EOF) return 0; } while (c < '0' || c > '9');
   uint64_t v = 0; while (c >= '0' && c <= '9') { v = v * 10 + (uint64_t)(c - '0'); c = getc_unlocked(f); }
@@ -125,31 +134,33 @@ static int cmd_dictmerge(const char *oldp, const char *relp, const char *newp, c
 static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *outp, const char *cmd) {
   uint64_t nm; uint32_t *map = load_u32(maprelp, &nm);
   if (nm != N) die("release map size differs from the node count");
-  uint32_t *indeg = xcalloc(N, 4); uint64_t a, b, e1 = 0, prev = 0, h1 = 0, h2 = 0;
+  uint32_t *indeg = xcalloc(N, 4); uint64_t a, b, e1 = 0, prev = 0, h1[2] = {1, 2}, h2[2] = {1, 2};
   FILE *p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
   while (rdu(p, &a)) {
     if (!rdu(p, &b)) die("odd number of integers in the edge stream");
     if (a >= N || b >= N) die("edge id out of range");
     if (a < prev) die("edges are not sorted by source");
-    prev = a; indeg[b]++; e1++; h1 += (a * 0x9E3779B97F4A7C15ULL) ^ (b * 0xC2B2AE3D27D4EB4FULL) ^ e1;
+    prev = a; indeg[b]++; e1++; fp_add(h1, a, b);
   }
   if (pclose(p)) die("edge command failed on pass 1");
   if (e1 != E) { fprintf(stderr, "lg: pass 1 read %llu edges, properties say %llu\n", (unsigned long long)e1, (unsigned long long)E); exit(4); }
   uint64_t *off = xmalloc((N + 1) * 8); off[0] = 0;
   for (uint64_t i = 0; i < N; i++) off[i + 1] = off[i] + indeg[i];
   free(indeg);
-  uint32_t *src = xmalloc(E * 4); uint64_t e2 = 0;
+  uint32_t *src = xmalloc(E * 4); uint64_t e2 = 0; prev = 0;
   p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
   while (rdu(p, &a)) {
     if (!rdu(p, &b)) die("odd number of integers in the edge stream");
     if (a >= N || b >= N) die("edge id out of range");
     if (e2 >= E) die("pass 2 read more edges than pass 1");
+    if (a < prev) die("edges are not sorted by source (pass 2)");
+    prev = a;
     if (off[b] >= E) die("pass 2 differs from pass 1");
-    src[off[b]++] = (uint32_t)a; e2++; h2 += (a * 0x9E3779B97F4A7C15ULL) ^ (b * 0xC2B2AE3D27D4EB4FULL) ^ e2;
+    src[off[b]++] = (uint32_t)a; e2++; fp_add(h2, a, b);
   }
   if (pclose(p)) die("edge command failed on pass 2");
   if (e2 != E) die("pass 2 read a different number of edges");
-  if (h1 != h2) die("pass 2 read different edges than pass 1 (checksum)");
+  if (h1[0] != h2[0] || h1[1] != h2[1]) die("pass 2 read different edges than pass 1 (fingerprint)");
   for (uint64_t i = N; i > 0; i--) off[i] = off[i - 1];   // each off[i] now holds the end = old start of i+1
   off[0] = 0;
   if (off[N] != E) die("inbound offsets do not add up");
@@ -171,7 +182,7 @@ typedef struct { uint64_t tgt, n, cap; uint32_t *src; uint8_t *first, *last; } R
 static void rec_room(Rec *r, uint64_t n) {
   if (n > r->cap) { r->cap = n + n / 2 + 16; r->src = xrealloc(r->src, r->cap * 4); r->first = xrealloc(r->first, r->cap); r->last = xrealloc(r->last, r->cap); }
 }
-typedef struct { FILE *f; uint64_t left; } HistIn;   // records left in the current shard
+typedef struct { FILE *f; uint64_t left, shards; } HistIn;   // records left in the current shard; shards opened
 static int hist_next(HistIn *h, Rec *r) {
   if (!h->f) return 0;
   while (h->left == 0) {
@@ -179,7 +190,7 @@ static int hist_next(HistIn *h, Rec *r) {
     if (k == 0) return 0;
     if (k != 4 || memcmp(m, "LGH1", 4)) die("history shard header missing");
     uint64_t c; if (fread(&c, 8, 1, h->f) != 1) die("history shard header truncated");
-    h->left = c;
+    h->left = c; h->shards++;
   }
   r->tgt = vneed(h->f); r->n = vneed(h->f); rec_room(r, r->n);
   uint64_t ps = 0;
@@ -194,7 +205,10 @@ static void hist_close(HistOut *w) {
   fseeko(w->f, w->hdr + 4, SEEK_SET); fwrite(&w->recs, 8, 1, w->f);
   if (fclose(w->f)) die("close failed"); w->f = NULL; w->shard++;
   if (w->on_shard) {
-    char c[8400]; snprintf(c, sizeof c, "%s '%s'", w->on_shard, w->path);
+    char q[8300]; size_t o = 0; q[o++] = '\'';   // single-quote the path, escaping any quote inside it
+    for (const char *s = w->path; *s; s++) { if (o + 6 >= sizeof q) die("path too long"); if (*s == '\'') { memcpy(q + o, "'\\''", 4); o += 4; } else q[o++] = *s; }
+    q[o++] = '\''; q[o] = 0;
+    char c[8600]; snprintf(c, sizeof c, "%s %s", w->on_shard, q);
     if (system(c) != 0) die("the on-shard command failed");
   }
 }
@@ -217,14 +231,28 @@ static void hist_put(HistOut *w, const Rec *r) {
   w->recs++; w->total_bytes += w->bytes - before;
 }
 
-static int cmd_merge(int ri, const char *prevcmd, const char *mapoldp, const char *relp, const char *outdir, uint64_t shard_kb, const char *on_shard) {
+// Reads a history index: the release it was built through and how many distinct shards it lists.
+static void read_idx_head(const char *p, int *release, uint64_t *shards) {
+  FILE *f = xopen(p, "rb"); char line[512]; uint64_t sh, o, t, last = UINT64_MAX; *shards = 0;
+  if (!fgets(line, sizeof line, f) || sscanf(line, "#release\t%d", release) != 1) die("history index has no #release line");
+  while (fgets(line, sizeof line, f)) {
+    if (sscanf(line, "%llu\t%llu\t%llu", (unsigned long long *)&sh, (unsigned long long *)&o, (unsigned long long *)&t) != 3) die("bad history index line");
+    if (sh != last) { if (last != UINT64_MAX && sh != last + 1) die("history index shards not consecutive"); (*shards)++; last = sh; }
+  }
+  fclose(f);
+}
+static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const char *mapoldp, const char *relp, const char *outdir, uint64_t shard_kb, const char *on_shard) {
   if (ri < 0 || ri > 254) die("release index must be 0..254");
-  uint64_t nmo = 0; uint32_t *mo = NULL;
+  uint64_t nmo = 0, want_shards = 0; uint32_t *mo = NULL; int prev_release = -1;
   HistIn h = {0};
+  if (!strcmp(prevcmd, "-") != !strcmp(previdx, "-")) die("give both the history command and its index, or neither");
+  if (strcmp(previdx, "-")) read_idx_head(previdx, &prev_release, &want_shards);
+  if (ri != prev_release + 1) { fprintf(stderr, "lg: release %d is not the one after %d\n", ri, prev_release); exit(3); }
   if (strcmp(prevcmd, "-")) { mo = load_u32(mapoldp, &nmo); h.f = popen(prevcmd, "r"); if (!h.f) die("cannot run the history command"); }
   FILE *rf = xopen(relp, "rb");
   char ip[4096]; snprintf(ip, sizeof ip, "%s/history.idx", outdir);
   HistOut w = { .dir = outdir, .on_shard = on_shard, .limit = shard_kb << 10 }; w.idx = xopen(ip, "wb");
+  fprintf(w.idx, "#release\t%d\n", ri);
   Rec hp = {0}, rr = {0}, out = {0};
   uint64_t links = 0, fresh = 0, again = 0, carried = 0, targets = 0, prev_t = 0; int have_prev_t = 0;
   int hh = hist_next(&h, &hp);
@@ -254,8 +282,14 @@ static int cmd_merge(int ri, const char *prevcmd, const char *mapoldp, const cha
     if (take_h) { hh = hist_next(&h, &hp); if (hh) REMAP_PREV(); }
     if (take_r) { hr = vget(rf, &rt); if (hr) rn = vneed(rf); }
   }
-  hist_close(&w);
+  if (h.f && (h.left != 0 || h.shards != want_shards)) {
+    fprintf(stderr, "lg: previous history incomplete: %llu of %llu shards, %llu records missing in the last\n",
+            (unsigned long long)h.shards, (unsigned long long)want_shards, (unsigned long long)h.left);
+    exit(4);
+  }
+  if (h.f && getc(h.f) != EOF) die("previous history has data after its last shard");
   if (h.f && pclose(h.f)) die("history command failed");
+  hist_close(&w);
   fclose(rf); if (fclose(w.idx)) die("close failed");
   printf("{\"release_index\": %d, \"targets\": %llu, \"links\": %llu, \"new\": %llu, \"seen_again\": %llu, \"not_seen_this_release\": %llu, \"shards\": %llu, \"bytes\": %llu}\n",
          ri, (unsigned long long)targets, (unsigned long long)links, (unsigned long long)fresh, (unsigned long long)again,
@@ -279,11 +313,13 @@ static Names load_names(const char *p) {
 }
 static int cmd_dump(const char *dir, const char *namesp) {
   Names nm = load_names(namesp); char ip[4096]; snprintf(ip, sizeof ip, "%s/history.idx", dir);
-  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, lastsh = UINT64_MAX; Rec r = {0};
-  while (fscanf(ix, "%llu\t%llu\t%llu\n", (unsigned long long *)&sh, (unsigned long long *)&offv, (unsigned long long *)&ft) == 3) {
+  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, lastsh = UINT64_MAX; Rec r = {0}; char ln[512];
+  while (fgets(ln, sizeof ln, ix)) {
+    if (ln[0] == '#') continue;
+    if (sscanf(ln, "%llu\t%llu\t%llu", (unsigned long long *)&sh, (unsigned long long *)&offv, (unsigned long long *)&ft) != 3) die("bad history index line");
     if (sh == lastsh) continue; lastsh = sh;
     char p[4096]; snprintf(p, sizeof p, "%s/h-%05llu.bin", dir, (unsigned long long)sh);
-    HistIn h = { xopen(p, "rb"), 0 };
+    HistIn h = { xopen(p, "rb"), 0, 0 };
     while (hist_next(&h, &r)) for (uint64_t k = 0; k < r.n; k++) {
       if (r.tgt >= nm.n || r.src[k] >= nm.n) die("id outside the names list");
       printf("%s\t%s\t%u\t%u\n", nm.s[r.tgt], nm.s[r.src[k]], r.first[k], r.last[k]);
@@ -304,8 +340,12 @@ static int cmd_lookup(const char *dir, const char *namesp, const char *domain) {
   uint64_t lo = 0, hi = nm.n; while (lo < hi) { uint64_t m = (lo + hi) / 2; if (strcmp(nm.s[m], rv) < 0) lo = m + 1; else hi = m; }
   if (lo >= nm.n || strcmp(nm.s[lo], rv)) { printf("{\"domain\": \"%s\", \"known\": false}\n", domain); return 0; }
   uint64_t id = lo; char ip[4096]; snprintf(ip, sizeof ip, "%s/history.idx", dir);
-  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, bsh = UINT64_MAX, boff = 0;
-  while (fscanf(ix, "%llu\t%llu\t%llu\n", (unsigned long long *)&sh, (unsigned long long *)&offv, (unsigned long long *)&ft) == 3) { if (ft > id) break; bsh = sh; boff = offv; }
+  FILE *ix = xopen(ip, "rb"); uint64_t sh, offv, ft, bsh = UINT64_MAX, boff = 0; char ln[512];
+  while (fgets(ln, sizeof ln, ix)) {
+    if (ln[0] == '#') continue;
+    if (sscanf(ln, "%llu\t%llu\t%llu", (unsigned long long *)&sh, (unsigned long long *)&offv, (unsigned long long *)&ft) != 3) die("bad history index line");
+    if (ft > id) break; bsh = sh; boff = offv;
+  }
   fclose(ix);
   if (bsh == UINT64_MAX) { printf("{\"domain\": \"%s\", \"known\": true, \"linking_domains\": 0}\n", domain); return 0; }
   char p[4096]; snprintf(p, sizeof p, "%s/h-%05llu.bin", dir, (unsigned long long)bsh);
@@ -325,7 +365,7 @@ int main(int argc, char **argv) {
   if (argc == 3 && !strcmp(argv[1], "names")) return cmd_names(argv[2]);
   if (argc == 7 && !strcmp(argv[1], "dictmerge")) return cmd_dictmerge(argv[2], argv[3], argv[4], argv[5], argv[6]);
   if (argc == 7 && !strcmp(argv[1], "inbound")) return cmd_inbound(strtoull(argv[2], 0, 10), strtoull(argv[3], 0, 10), argv[4], argv[5], argv[6]);
-  if ((argc == 8 || argc == 9) && !strcmp(argv[1], "merge")) return cmd_merge(atoi(argv[2]), argv[3], argv[4], argv[5], argv[6], strtoull(argv[7], 0, 10), argc == 9 ? argv[8] : NULL);
+  if ((argc == 9 || argc == 10) && !strcmp(argv[1], "merge")) return cmd_merge(atoi(argv[2]), argv[3], argv[4], argv[5], argv[6], argv[7], strtoull(argv[8], 0, 10), argc == 10 ? argv[9] : NULL);
   if (argc == 4 && !strcmp(argv[1], "dump")) return cmd_dump(argv[2], argv[3]);
   if (argc == 5 && !strcmp(argv[1], "lookup")) return cmd_lookup(argv[2], argv[3], argv[4]);
   fprintf(stderr, "usage: see the header of lg.c\n"); return 2;
