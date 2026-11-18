@@ -57,8 +57,15 @@ if [ "$avail" -gt 0 ] && [ "$need" -gt $(( avail - 1500000000 )) ]; then echo "n
 
 log "names"
 curl -sSf --retry 5 --retry-delay 30 "$B-domain-vertices.txt.gz" | gzip -dc | "$LG" names rel_names.txt
-rc=0; python3 "$here/hf.py" get domains.txt old_domains.txt || rc=$?
-if [ "$rc" = 3 ]; then [ "$RI" = 0 ] || { echo "domains.txt missing after release 0"; exit 1; }; OLD=-; elif [ "$rc" = 0 ]; then OLD=old_domains.txt; else exit 1; fi
+sha() { python3 -c 'import hashlib,sys; h=hashlib.sha256(); f=open(sys.argv[1],"rb"); [h.update(c) for c in iter(lambda: f.read(1<<22), b"")]; print(h.hexdigest())' "$1"; }
+if [ "$RI" = 0 ]; then OLD=-; else
+  python3 "$here/hf.py" get domains.txt old_domains.txt
+  # the domain list must be the very one the last release wrote: its hash and line count are in the release log
+  want=$(tail -1 done.tsv | cut -f6,7)
+  got="$(sha old_domains.txt)	$(wc -l < old_domains.txt | tr -d ' ')"
+  [ "$want" = "$got" ] || { echo "domains.txt is not the list the last release recorded: stop"; exit 1; }
+  OLD=old_domains.txt
+fi
 "$LG" dictmerge "$OLD" rel_names.txt domains.txt map_old.u32 map_rel.u32
 rm -f rel_names.txt old_domains.txt
 
@@ -81,7 +88,7 @@ rm -f map_old.u32 rel.bin
 if [ "${LG_DRY:-0}" = 1 ]; then log "dry run: built $(ls hist | wc -l) files, uploaded nothing"; du -sh hist; exit 0; fi
 log "publish"
 cp done.tsv releases.tsv
-printf '%s\t%s\t%s\t%s\t%s\n' "$RI" "$R" "$N" "$E" "$(date -u +%FT%TZ)" >> releases.tsv
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RI" "$R" "$N" "$E" "$(date -u +%FT%TZ)" "$(sha domains.txt)" "$(wc -l < domains.txt | tr -d ' ')" >> releases.tsv
 python3 "$here/hf.py" put hist/history.idx history/history.idx manifest.tsv
 python3 "$here/hf.py" put domains.txt domains.txt manifest.tsv
 python3 "$here/hf.py" put domains.txt.idx domains.txt.idx manifest.tsv

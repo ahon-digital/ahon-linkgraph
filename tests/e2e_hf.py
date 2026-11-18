@@ -92,6 +92,20 @@ try:
     got = {(l.split("\t")[0], l.split("\t")[1]): [int(l.split("\t")[2]), int(l.split("\t")[3])] for l in dump}
     if got != ref:
         fails.append(f"published history differs: {len(got)} vs {len(ref)} links")
+    # a domain list that is not the one the last release recorded must stop the run (hash + count in the log)
+    open(f"{T}/other_domains.txt", "w").write("com.aaaa\ncom.zzzz\n"); man0 = f"{T}/dom.manifest"
+    subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "put", f"{T}/other_domains.txt", "domains.txt", man0], env=env, check=True, capture_output=True)
+    subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "commit", "e2e: swap the domain list", man0], env=env, check=True, capture_output=True)
+    open(T + "/list.txt", "a").write("cc-main-2022-test\n")                    # give the runner a next release to try
+    R4 = "cc-main-2022-test"; d4 = f"{T}/cc/{R4}/domain"; os.makedirs(d4)
+    with gzip.open(f"{d4}/{R4}-domain-vertices.txt.gz", "wt") as f: f.write("0\tcom.a\t1\n1\tcom.b\t1\n")
+    with gzip.open(f"{d4}/{R4}-domain-edges.txt.gz", "wt") as f: f.write("0\t1\n")
+    open(f"{d4}/{R4}-domain.properties", "w").write("nodes=2\narcs=1\n")
+    p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=f"{T}/swapdom"), capture_output=True, text=True)
+    if p.returncode == 0 or "not the list the last release recorded" not in p.stdout:
+        fails.append(f"swapped domain list not refused (exit {p.returncode}): {p.stdout[-200:]}")
+    if get("history/history.idx") != idx:
+        fails.append("history changed after the swapped-domains run")
     # review round 5: an EMPTY release log next to the history must stop the run too
     def commit_ops(summary, ops):
         body = (json.dumps({"key": "header", "value": {"summary": summary}}) + "\n" + "".join(json.dumps(o) + "\n" for o in ops)).encode()

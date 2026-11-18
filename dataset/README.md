@@ -26,8 +26,9 @@ Common Crawl samples the web, so a missing link means "not seen in these crawls"
 
 ## Files
 
-- `releases.tsv`: one line per release folded in: index, release name, domains, links, date added. A link's
-  first and last values below are these indexes.
+- `releases.tsv`: one line per release folded in: index, release name, domains, links, date added, then the
+  sha256 and line count of `domains.txt` as that release left it. A link's first and last values below are these
+  indexes.
 - `domains.txt`: every domain ever seen, in reversed notation (`com.example`, `uk.co.example`), one a line, in byte
   order. A domain's id is its line number, counting from 0. `domains.txt.idx` gives, every 4,096 lines, the line
   block number, its byte offset and its first name, so one domain can be found with a single range read.
