@@ -225,7 +225,8 @@ typedef struct { uint64_t tgt, n, cap; uint32_t *src; uint8_t *first, *last; } R
 static void rec_room(Rec *r, uint64_t n) {
   if (n > r->cap) { r->cap = n + n / 2 + 16; r->src = xrealloc(r->src, r->cap * 4); r->first = xrealloc(r->first, r->cap); r->last = xrealloc(r->last, r->cap); }
 }
-typedef struct { FILE *f; uint64_t left, shards, used; const uint64_t *want, *wantb; uint64_t nwant; } HistIn;   // records left in the current shard; shards opened; bytes read in it; expected records and bytes per shard
+typedef struct { uint64_t *s, *o, *t, n; } Blocks;   // the index's block lines: shard, offset, first target
+typedef struct { FILE *f; uint64_t left, shards, used; const uint64_t *want, *wantb; uint64_t nwant; const Blocks *blk; uint64_t bi; } HistIn;   // records left in the current shard; shards opened; bytes read in it; expected records and bytes per shard
 static int hgetc(HistIn *h) { int c = getc(h->f); if (c == EOF) die("truncated record"); h->used++; return c; }
 static uint64_t hvar(HistIn *h) {
   uint64_t v = 0; int sh = 0, c;
@@ -233,6 +234,8 @@ static uint64_t hvar(HistIn *h) {
 }
 static void hist_shard_done(HistIn *h) {   // the shard just finished must have exactly the bytes the index records
   if (h->wantb && h->shards > 0 && h->used != h->wantb[h->shards - 1]) die("a history shard's size differs from the index");
+  // and every block line the index gave for that shard must have been met in the data
+  if (h->blk && h->shards > 0 && h->bi < h->blk->n && h->blk->s[h->bi] == h->shards - 1) die("a history index block was never met in its shard");
 }
 static int hist_next(HistIn *h, Rec *r) {
   if (!h->f) return 0;
@@ -245,11 +248,18 @@ static int hist_next(HistIn *h, Rec *r) {
     if (h->want) { if (h->shards >= h->nwant || c != h->want[h->shards]) die("a history shard's record count differs from the index"); }
     h->left = c; h->shards++; h->used = 12;
   }
+  uint64_t at = h->used, sh = h->shards - 1;
   r->tgt = hvar(h); if (r->tgt > UINT32_MAX) die("bad target id in history"); r->n = hvar(h); rec_room(r, r->n);
+  if (h->blk && h->bi < h->blk->n && h->blk->s[h->bi] == sh && h->blk->o[h->bi] <= at) {
+    // the index promised a record starting exactly here with exactly this target: the data must agree
+    if (h->blk->o[h->bi] != at || h->blk->t[h->bi] != r->tgt) die("a history index block disagrees with the shard's data");
+    h->bi++;
+  }
   uint64_t ps = 0;
   for (uint64_t k = 0; k < r->n; k++) {
     uint64_t d = hvar(h); if (d > UINT32_MAX - ps || (k > 0 && d == 0)) die("bad source id in history");
     ps += d; r->src[k] = (uint32_t)ps; r->first[k] = (uint8_t)hgetc(h); r->last[k] = (uint8_t)hgetc(h);
+    if (r->first[k] > r->last[k]) die("a link's first release is after its last");
   }
   h->left--; return 1;
 }
@@ -290,7 +300,7 @@ static void hist_put(HistOut *w, const Rec *r) {
 }
 
 // Reads a history index: the release it was built through and how many distinct shards it lists.
-static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_t **recs, uint64_t **bytes) {
+static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_t **recs, uint64_t **bytes, Blocks *blk) {
   FILE *f = xopen(p, "rb"); char *line = NULL; size_t lcap = 0; uint64_t sh, last = UINT64_MAX, nrec = 0, v[3]; *shards = 0;
   *recs = xmalloc(8 * 64); *bytes = xmalloc(8 * 64); uint64_t cap = 64;
   if (gline(&line, &lcap, f) <= 0 || strncmp(line, "#release\t", 9)) die("history index has no #release line");
@@ -319,14 +329,15 @@ static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_
     if (bo[i] >= (*bytes)[bs[i]]) die("history index: block offset past its shard's size");
     if (i > 0 && bt[i] <= bt[i - 1]) die("history index: first targets not increasing");
   }
-  free(bs); free(bo); free(bt);
+  if (blk) { blk->s = bs; blk->o = bo; blk->t = bt; blk->n = nb; } else { free(bs); free(bo); free(bt); }
 }
 static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const char *mapoldp, const char *relp, const char *outdir, uint64_t shard_kb, const char *on_shard) {
   if (ri < 0 || ri > 254) die("release index must be 0..254");
   uint64_t nmo = 0, want_shards = 0, *want_recs = NULL, *want_bytes = NULL; uint32_t *mo = NULL; int prev_release = -1;
   HistIn h = {0};
   if (!strcmp(prevcmd, "-") != !strcmp(previdx, "-")) die("give both the history command and its index, or neither");
-  if (strcmp(previdx, "-")) { read_idx_head(previdx, &prev_release, &want_shards, &want_recs, &want_bytes); h.want = want_recs; h.wantb = want_bytes; h.nwant = want_shards; }
+  static Blocks pblk;
+  if (strcmp(previdx, "-")) { read_idx_head(previdx, &prev_release, &want_shards, &want_recs, &want_bytes, &pblk); h.want = want_recs; h.wantb = want_bytes; h.nwant = want_shards; h.blk = &pblk; }
   if (ri != prev_release + 1) { fprintf(stderr, "lg: release %d is not the one after %d\n", ri, prev_release); exit(3); }
   if (strcmp(prevcmd, "-")) { mo = load_u32(mapoldp, &nmo); h.f = popen(prevcmd, "r"); if (!h.f) die("cannot run the history command"); }
   FILE *rf = xopen(relp, "rb");
@@ -387,6 +398,7 @@ static int rec_read(FILE *f, Rec *r) {   // one record without a shard header; 0
   for (uint64_t k = 0; k < r->n; k++) {
     uint64_t d = vneed(f); if (d > UINT32_MAX - ps || (k > 0 && d == 0)) die("bad source id in history");
     ps += d; r->src[k] = (uint32_t)ps; r->first[k] = (uint8_t)bget(f); r->last[k] = (uint8_t)bget(f);
+    if (r->first[k] > r->last[k]) die("a link's first release is after its last");
   }
   return 1;
 }
@@ -453,7 +465,7 @@ int main(int argc, char **argv) {
   if (argc == 7 && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6]);
   if ((argc == 9 || argc == 10) && !strcmp(argv[1], "merge")) return cmd_merge((int)num(argv[2], 254, "REL_INDEX"), argv[3], argv[4], argv[5], argv[6], argv[7], num(argv[8], 1ULL << 24, "SHARD_KB"), argc == 10 ? argv[9] : NULL);
   if (argc == 3 && !strcmp(argv[1], "checkidx")) {   // full validation of a history index; prints its release
-    int rel; uint64_t sh, *rc, *by; read_idx_head(argv[2], &rel, &sh, &rc, &by);
+    int rel; uint64_t sh, *rc, *by; read_idx_head(argv[2], &rel, &sh, &rc, &by, NULL);
     printf("%d\n", rel); return 0;
   }
   if (argc == 4 && !strcmp(argv[1], "dump")) return cmd_dump(argv[2], argv[3]);

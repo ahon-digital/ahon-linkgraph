@@ -258,6 +258,58 @@ def test_file_overwritten_during_upload_refused():
     assert refused and not os.path.exists(f.name + ".m")
 
 
+def _refused(fn):
+    try:
+        fn(); return False
+    except SystemExit:
+        return True
+
+
+def test_malformed_listing_is_never_empty():
+    for body in (b'[{"path": "releases.tsv", "type": "fi', b'{"not": "a list"}', b'[{"type": "file"}]', b'[1, 2]'):
+        hf = load()
+        hf.req = lambda method, url, data=None, headers=None, stream=False, timeout=0, tries=4, b=body: (200, b)
+        assert _refused(lambda: hf.meta("releases.tsv")), body
+    hf = load()
+    hf.req = lambda method, url, data=None, headers=None, stream=False, timeout=0, tries=4: (404, b"")
+    assert hf.meta("releases.tsv") is None                       # a real 404 is still a real absence
+
+
+def test_fresh_needs_its_own_empty_answer():
+    import json as _j
+    def info(body, st=200):
+        hf = load(); hf.req = lambda method, url, data=None, headers=None, stream=False, timeout=0, tries=4: (st, body); return hf
+    assert info(b"", 404).fresh() == 0
+    assert info(_j.dumps({"siblings": [{"rfilename": "README.md"}, {"rfilename": ".gitattributes"}]}).encode()).fresh() == 0
+    assert info(_j.dumps({"siblings": [{"rfilename": "history/history.idx"}]}).encode()).fresh() == 3
+    for bad in (b"{oops", b'{"siblings": "x"}', b'{"siblings": [{"name": 1}]}', b"[]"):
+        assert _refused(lambda: info(bad).fresh()), bad
+
+
+def test_multipart_parts_in_numeric_order():
+    hf = load(); import json as _j, tempfile
+    body = b"abcdefghijkl"; f = tempfile.NamedTemporaryFile(delete=False); f.write(body); f.close()
+    hdr = {"chunk_size": "1"}; hdr.update({str(i): f"https://storage.example/p{i}" for i in range(1, 13)})
+    got = {}
+    def neg(method, url, data=None, headers=None, stream=False, timeout=0, tries=4):
+        if url.endswith("/objects/batch"):
+            return 200, _j.dumps({"objects": [{"actions": {"upload": {"href": "https://huggingface.co/complete", "header": hdr}}}]}).encode()
+        got["complete"] = _j.loads(data); return 200, b"{}"
+    hf.req = neg
+    class Ok:
+        status = 200; headers = {"ETag": "e"}
+        def __init__(self, u): self.headers = {"ETag": u}
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def send(r, timeout=0):
+        got[int(r.full_url.rsplit("p", 1)[1])] = r.data; return Ok(r.full_url)
+    hf.OPENER.open = send
+    hf.put(f.name, "x.bin", f.name + ".m")
+    assert b"".join(got[i] for i in range(1, 13)) == body
+    assert [p["partNumber"] for p in got["complete"]["parts"]] == list(range(1, 13))
+    assert [p["etag"] for p in got["complete"]["parts"]] == [f"https://storage.example/p{i}" for i in range(1, 13)]
+
+
 def _guard_output(fn):
     hf = load()
     err = io.StringIO(); keep = sys.stdout, sys.stderr

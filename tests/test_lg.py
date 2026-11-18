@@ -275,6 +275,22 @@ def body():
     bad = list(lines); bad.insert(i + 1, "\t".join([f0[0], "13", "0"]))       # a target going backwards
     open(f"{W}/badrel2.idx", "w").write("\n".join(bad) + "\n")
     check("index first targets going backwards refused", run("checkidx", f"{W}/badrel2.idx", ok=False).returncode != 0)
+    # review round 9: index descriptors must match the data; a link's first release is never after its last
+    lines = open(f"{r2}/history.idx").read().splitlines()
+    blk = [(k, l.split("\t")) for k, l in enumerate(lines) if l and not l.startswith("#")]
+    pick = next((k, f) for (k, f), (k2, f2) in zip(blk, blk[1:]) if int(f2[2]) > int(f[2]) + 1)
+    k, f = pick; bad = list(lines); bad[k] = "\t".join([f[0], f[1], str(int(f[2]) + 1)])
+    os.makedirs(f"{W}/desc/src"); [shutil.copy(f"{r2}/{x}", f"{W}/desc/src/{x}") for x in os.listdir(r2) if x.startswith("h-")]
+    open(f"{W}/desc/src/history.idx", "w").write("\n".join(bad) + "\n"); os.makedirs(f"{W}/desc/out")
+    check("fixture: altered index still passes checkidx (only the data can tell)", run("checkidx", f"{W}/desc/src/history.idx", ok=False).returncode == 0)
+    r = run("merge", "3", f"cat {W}/desc/src/h-*.bin", f"{W}/desc/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/desc/out", "2", ok=False)
+    check("index block disagreeing with the data refused", r.returncode != 0, r.stderr.strip()[:80])
+    os.makedirs(f"{W}/fl/src"); [shutil.copy(f"{r2}/{x}", f"{W}/fl/src/{x}") for x in os.listdir(r2)]
+    lastsh = sorted(x for x in os.listdir(f"{W}/fl/src") if x.startswith("h-"))[-1]
+    raw = bytearray(open(f"{W}/fl/src/{lastsh}", "rb").read()); raw[-2], raw[-1] = 2, 0     # last link: first 2, last 0
+    open(f"{W}/fl/src/{lastsh}", "wb").write(raw); os.makedirs(f"{W}/fl/out")
+    r = run("merge", "3", f"cat {W}/fl/src/h-*.bin", f"{W}/fl/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/fl/out", "2", ok=False)
+    check("a link with first after last refused", r.returncode != 0, r.stderr.strip()[:80])
     idx_lines = open(f"{r2}/history.idx").read().splitlines()
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"

@@ -135,11 +135,25 @@ def req(method, url, data=None, headers=None, stream=False, timeout=300, tries=4
             raise SystemExit(f"hf.py: request failed on {method} {url.split('?')[0]}: {type(e).__name__}")
 
 
-def jsonbody(b):
+def jsonbody(b, shape=None):
+    """A reply's JSON, or a stop. A reply that does not parse, or is not the expected shape, is never read as
+    'empty': that conversion once turned a malformed listing into 'no history' and a fresh start."""
     try:
-        return json.loads(b)
+        v = json.loads(b)
     except ValueError:
-        return {}
+        sys.exit("hf.py: a reply was not valid JSON")
+    if shape is not None and not isinstance(v, shape):
+        sys.exit("hf.py: a reply had an unexpected shape")
+    return v
+
+
+def file_entries(b):
+    """A tree listing: a list of objects, each with a string path and type. Anything else stops."""
+    v = jsonbody(b, list)
+    for x in v:
+        if not isinstance(x, dict) or not isinstance(x.get("path"), str) or not isinstance(x.get("type"), str):
+            sys.exit("hf.py: a listing entry had an unexpected shape")
+    return [x for x in v if x["type"] == "file"]
 
 
 def ensure():
@@ -169,8 +183,9 @@ def meta(remote):
         elif st != 200:
             sys.exit(f"hf.py: listing {folder or '/'} failed {st}")
         else:
-            _META[folder] = {x["path"]: (x.get("lfs") or {}).get("size", x.get("size")) for x in jsonbody(b) if x.get("type") == "file"}
-            _META[folder + "#oid"] = {x["path"]: (x.get("lfs") or {}).get("oid") for x in jsonbody(b) if x.get("type") == "file"}
+            files = file_entries(b)
+            _META[folder] = {x["path"]: (x.get("lfs") or {}).get("size", x.get("size")) for x in files}
+            _META[folder + "#oid"] = {x["path"]: (x.get("lfs") or {}).get("oid") for x in files}
     if remote not in _META[folder]:
         return None
     return _META[folder][remote], _META[folder + "#oid"][remote]
@@ -254,7 +269,10 @@ def _put(fh, remote, manifest):
                             "objects": [{"oid": oid, "size": size}]}).encode(), lfs)
     if st != 200:
         sys.exit(f"hf.py: upload negotiation failed {st}")
-    obj = jsonbody(b)["objects"][0]
+    reply = jsonbody(b, dict)
+    if not isinstance(reply.get("objects"), list) or len(reply["objects"]) != 1 or not isinstance(reply["objects"][0], dict):
+        sys.exit("hf.py: upload negotiation reply had an unexpected shape")
+    obj = reply["objects"][0]
     if obj.get("error"):
         sys.exit(f"hf.py: upload refused: {obj['error']}")
     act = obj.get("actions", {})
@@ -262,7 +280,9 @@ def _put(fh, remote, manifest):
         up, hdr = act["upload"], act["upload"].get("header", {})
         if "chunk_size" in hdr:
             cs = int(hdr["chunk_size"])
-            parts = sorted(k for k in hdr if k.isdigit())
+            parts = sorted((k for k in hdr if k.isdigit()), key=int)   # numeric order: part 10 comes after part 9
+            if [int(k) for k in parts] != list(range(1, len(parts) + 1)):
+                sys.exit("hf.py: upload parts are not numbered 1..n")
             etags = []
             sent, t, tail = hashlib.sha256(), TOKEN.encode(), b""
             if True:
@@ -317,7 +337,7 @@ def tree(prefix):
         return out
     if st != 200:
         sys.exit(f"hf.py: listing {prefix} failed {st}")
-    return [x["path"] for x in jsonbody(b) if x.get("type") == "file"]
+    return [x["path"] for x in file_entries(b)]
 
 
 def commit(message, manifest, delete_prefix=None):
@@ -337,7 +357,7 @@ def commit(message, manifest, delete_prefix=None):
     st, b = req("POST", f"{H}/api/datasets/{REPO}/commit/main", body, {"Content-Type": "application/x-ndjson"}, timeout=900)
     if st != 200:
         sys.exit(f"hf.py: commit failed {st}: {b[:200]!r}")
-    print(json.dumps({"committed": len(rows), "deleted": deleted, "commit": jsonbody(b).get("commitOid", "")[:12]}))
+    print(json.dumps({"committed": len(rows), "deleted": deleted}))
     return 0
 
 
@@ -353,6 +373,8 @@ def main():
     a = sys.argv[1:]
     if a[:1] == ["ensure"]:
         sys.exit(ensure())
+    if a[:1] == ["fresh"]:
+        sys.exit(fresh())
     if a[:1] == ["domsha"]:
         sys.exit(dom_sha())
     if a[:1] == ["exists"] and len(a) == 2:
@@ -368,6 +390,23 @@ def main():
     if a[:1] == ["squash"]:
         sys.exit(squash())
     sys.exit(__doc__)
+
+
+def fresh():
+    """Second, independent answer to 'is this dataset empty?' from a different endpoint than the tree listing:
+    0 = no dataset or no data files (fresh start allowed), 3 = it holds data, 1 = cannot tell. Only both answers
+    together allow a fresh start, so one malformed endpoint cannot trigger it."""
+    st, b = req("GET", f"{H}/api/datasets/{REPO}")
+    if st == 404:
+        return 0
+    if st != 200:
+        sys.exit(f"hf.py: repo info failed {st}")
+    info = jsonbody(b, dict)
+    sib = info.get("siblings")
+    if not isinstance(sib, list) or not all(isinstance(x, dict) and isinstance(x.get("rfilename"), str) for x in sib):
+        sys.exit("hf.py: repo info had an unexpected shape")
+    data = [x["rfilename"] for x in sib if x["rfilename"] not in (".gitattributes", "README.md")]
+    return 3 if data else 0
 
 
 def dom_sha():

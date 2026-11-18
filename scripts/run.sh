@@ -27,6 +27,9 @@ for v in "$rel_rc" "$idx_rc" "$dom_rc"; do case "$v" in 0|3) ;; *) echo "cannot 
 # Exactly two valid states: nothing at all (fresh start), or all three present and agreeing. We never write an
 # empty release log, so an empty one is as broken as a missing one.
 if [ "$rel_rc" = 3 ] && [ "$idx_rc" = 3 ] && [ "$dom_rc" = 3 ]; then
+  # a fresh start rewrites everything, so it needs a second, independent "empty" from another endpoint
+  fr=0; python3 "$here/hf.py" fresh || fr=$?
+  [ "$fr" = 0 ] || { echo "listing says empty but the repo holds data (or cannot tell): stop"; exit 1; }
   : > done.tsv
 elif [ "$rel_rc" = 0 ] && [ "$idx_rc" = 0 ] && [ "$dom_rc" = 0 ]; then
   [ -s done.tsv ] || { echo "release log is empty next to an existing history: stop"; exit 1; }

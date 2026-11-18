@@ -31,6 +31,7 @@ jobs:
           gcc -O2 -Wall -Wextra -Werror -o lg src/lg.c
           python3 tests/test_lg.py ./lg
           python3 tests/test_hf_token.py
+          python3 tests/test_run_state.py
       - name: Fold the next release
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
