@@ -56,13 +56,13 @@ log "next: $R (index $RI)"
 B="$CC/$R/domain/$R"
 curl -sSf --retry 5 --retry-delay 30 "$B-domain.properties" -o props.txt
 N=$(sed -n 's/^nodes=//p' props.txt); E=$(sed -n 's/^arcs=//p' props.txt)
-need=$(( 8 * (N + 1) + 4 * E + 4 * N ))
+need=$(( 8 * (N + 1) + 4 * E + 8 * N ))
 log "nodes $N links $E, memory needed about $((need / 1000000)) MB"
 avail=$(awk '/MemAvailable/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "$avail" -gt 0 ] && [ "$need" -gt $(( avail - 1500000000 )) ]; then echo "not enough memory ($((avail / 1000000)) MB available)"; exit 1; fi
 
 log "names"
-curl -sSf --retry 5 --retry-delay 30 "$B-domain-vertices.txt.gz" | gzip -dc | "$LG" names rel_names.txt
+curl -sSf --retry 5 --retry-delay 30 "$B-domain-vertices.txt.gz" | gzip -dc | "$LG" names rel_names.txt rel_order.u32
 sha() { python3 -c 'import hashlib,sys; h=hashlib.sha256(); f=open(sys.argv[1],"rb"); [h.update(c) for c in iter(lambda: f.read(1<<22), b"")]; print(h.hexdigest())' "$1"; }
 if [ "$RI" = 0 ]; then OLD=-; else
   python3 "$here/hf.py" get domains.txt old_domains.txt
@@ -76,8 +76,8 @@ fi
 rm -f rel_names.txt old_domains.txt
 
 log "inbound (two streamed passes)"
-"$LG" inbound "$N" "$E" map_rel.u32 rel.bin "curl -sSf --retry 5 --retry-delay 30 '$B-domain-edges.txt.gz' | gzip -dc"
-rm -f map_rel.u32
+"$LG" inbound "$N" "$E" map_rel.u32 rel_order.u32 rel.bin "curl -sSf --retry 5 --retry-delay 30 '$B-domain-edges.txt.gz' | gzip -dc"
+rm -f map_rel.u32 rel_order.u32
 
 log "merge into history"
 # the dataset is created only here: past the "nothing to do" exit and never on a dry run (shards upload during merge)

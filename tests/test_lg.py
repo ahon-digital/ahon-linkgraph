@@ -43,6 +43,8 @@ def run(*args, ok=True, stdin=None):
     p = subprocess.run([LG, *args], capture_output=True, text=True, input=stdin)
     if ok and p.returncode:
         raise SystemExit(f"lg {args[0]} failed: {p.stderr.strip()}")
+    if not ok and "usage:" in p.stderr:   # a refusal test must be refused for its reason, never for bad arguments
+        fails.append(f"lg {args[0]} refused on usage, not on its input: test is wrong")
     return p
 
 
@@ -75,12 +77,15 @@ def body():
     prev_dir, prev_global = None, None
     for ri, (names, edges) in enumerate(releases):
         d = os.path.join(W, f"r{ri}"); os.makedirs(d)
+        if ri % 2 == 1:                       # list the names out of byte order, as Common Crawl's 2018 releases do
+            names = list(names); random.shuffle(names)
+            edges = sorted({(a, b) for a, b in edges})
         vtx = "".join(f"{i}\t{nm}\t1\n" for i, nm in enumerate(names))
         with open(f"{d}/edges.txt", "w") as f:
             f.write("".join(f"{a}\t{b}\n" for a, b in edges))
-        run("names", f"{d}/names.txt", stdin=vtx)
+        run("names", f"{d}/names.txt", f"{d}/order.u32", stdin=vtx)
         run("dictmerge", prev_global or "-", f"{d}/names.txt", f"{d}/global.txt", f"{d}/map_old.u32", f"{d}/map_rel.u32")
-        run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/rel.bin", f"cat {d}/edges.txt")
+        run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{d}/rel.bin", f"cat {d}/edges.txt")
         hd = f"{d}/hist"; os.makedirs(hd)
         prevcmd = f"cat {prev_dir}/h-*.bin" if prev_dir else "-"
         previdx = f"{prev_dir}/history.idx" if prev_dir else "-"
@@ -129,18 +134,22 @@ def body():
     check("failing hook stops the merge", r.returncode != 0)
 
     # refusals
-    r = run("names", f"{W}/bad.txt", ok=False, stdin="0\tcom.b\t1\n1\tcom.a\t1\n")
-    check("unsorted names refused", r.returncode != 0)
-    r = run("names", f"{W}/bad.txt", ok=False, stdin="0\tcom.a\t1\n2\tcom.b\t1\n")
+    r = run("names", f"{W}/ok.txt", f"{W}/ok.u32", stdin="0\tcom.b\t1\n1\tcom.a\t1\n")
+    check("names in any order accepted and sorted", open(f"{W}/ok.txt").read() == "com.a\ncom.b\n")
+    r = run("names", f"{W}/bad.txt", f"{W}/bad.u32", ok=False, stdin="0\tcom.b\t1\n1\tcom.a\t1\n2\tcom.b\t1\n")
+    check("duplicate names refused", r.returncode != 0)
+    r = run("names", f"{W}/c18.txt", f"{W}/c18.u32", stdin="0\tac.2-yr\t1\n1\tac.2\t1\n")   # the 2018 case
+    check("2018 ordering (ac.2-yr before ac.2) accepted", open(f"{W}/c18.txt").read() == "ac.2\nac.2-yr\n")
+    r = run("names", f"{W}/bad.txt", f"{W}/bad.u32", ok=False, stdin="0\tcom.a\t1\n2\tcom.b\t1\n")
     check("skipped id refused", r.returncode != 0)
     d = os.path.join(W, "r3")
     names, edges = releases[3]
-    r = run("inbound", str(len(names)), str(len(edges) + 1), f"{d}/map_rel.u32", f"{W}/x.bin", f"cat {d}/edges.txt", ok=False)
+    r = run("inbound", str(len(names)), str(len(edges) + 1), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", f"cat {d}/edges.txt", ok=False)
     check("wrong edge count refused", r.returncode != 0)
     flip = f"{W}/flip.sh"
     open(flip, "w").write(f"#!/bin/sh\nif [ -e {W}/once ]; then awk -F'\\t' 'NR==1{{$2=($2==0?1:0)}} {{print $1\"\\t\"$2}}' {d}/edges.txt; else touch {W}/once; cat {d}/edges.txt; fi\n")
     os.chmod(flip, 0o755)
-    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{W}/x.bin", flip, ok=False)
+    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", flip, ok=False)
     check("second pass differing refused", r.returncode != 0, r.stderr.strip()[:80])
     os.makedirs(f"{W}/again")
     r = run("merge", "3", f"cat {prev_dir}/h-*.bin", f"{prev_dir}/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/again", "2", ok=False)
@@ -164,16 +173,16 @@ def body():
     ident = f"{W}/ident17.u32"; open(ident, "wb").write(b"".join(i.to_bytes(4, "little") for i in range(17)))
     open(f"{W}/p1.txt", "w").write("4\t0\n16\t0\n"); open(f"{W}/p2.txt", "w").write("8\t0\n12\t0\n")
     alt = f"{W}/alt.sh"; open(alt, "w").write(f"#!/bin/sh\nif [ -e {W}/alt1 ]; then cat {W}/p2.txt; else touch {W}/alt1; cat {W}/p1.txt; fi\n"); os.chmod(alt, 0o755)
-    r = run("inbound", "17", "2", ident, f"{W}/c.bin", alt, ok=False)
+    r = run("inbound", "17", "2", ident, ident, f"{W}/c.bin", alt, ok=False)
     check("reviewer's fingerprint collision refused", r.returncode != 0, r.stderr.strip()[:80])
     open(f"{W}/p3.txt", "w").write("4\t1\n8\t5\n"); open(f"{W}/p4.txt", "w").write("8\t5\n4\t1\n")
     alt2 = f"{W}/alt2.sh"; open(alt2, "w").write(f"#!/bin/sh\nif [ -e {W}/alt2f ]; then cat {W}/p4.txt; else touch {W}/alt2f; cat {W}/p3.txt; fi\n"); os.chmod(alt2, 0o755)
-    r = run("inbound", "17", "2", ident, f"{W}/c.bin", alt2, ok=False)
+    r = run("inbound", "17", "2", ident, ident, f"{W}/c.bin", alt2, ok=False)
     check("second pass out of order refused", r.returncode != 0)
     # review round 2 follow-ups
     open(f"{W}/p5.txt", "w").write("0\t1\n"); open(f"{W}/p6.txt", "w").write("18446744073709551616\t1\n")
     alt3 = f"{W}/alt3.sh"; open(alt3, "w").write(f"#!/bin/sh\nif [ -e {W}/alt3f ]; then cat {W}/p6.txt; else touch {W}/alt3f; cat {W}/p5.txt; fi\n"); os.chmod(alt3, 0o755)
-    r = run("inbound", "17", "1", ident, f"{W}/c.bin", alt3, ok=False)
+    r = run("inbound", "17", "1", ident, ident, f"{W}/c.bin", alt3, ok=False)
     check("overflowing id in pass 2 refused", r.returncode != 0)
     import struct
     sh0 = sorted(x for x in os.listdir(r2) if x.startswith("h-"))[0]
@@ -227,7 +236,7 @@ def body():
     # review round 5: the edge reader and every index field are strict
     for bad_edge in ("-1\t0\n", "1 \t0\n", "1\t0\t5\n", "1\t\n", "\t1\n", "1\n"):
         open(f"{W}/be.txt", "w").write(bad_edge)
-        r = run("inbound", "17", "1", ident, f"{W}/c.bin", f"cat {W}/be.txt", ok=False)
+        r = run("inbound", "17", "1", ident, ident, f"{W}/c.bin", f"cat {W}/be.txt", ok=False)
         check(f"malformed edge {bad_edge!r} refused", r.returncode != 0)
     os.makedirs(f"{W}/emptyf/src"); [shutil.copy(f"{r2}/{x}", f"{W}/emptyf/src/{x}") for x in os.listdir(r2)]
     lines = open(f"{W}/emptyf/src/history.idx").read().splitlines(); lines[1] = lines[1].replace("\t", "\t\t", 1)
@@ -244,10 +253,10 @@ def body():
     open(f"{W}/cr/src/history.idx", "w").write("\n".join(lines) + "\n"); os.makedirs(f"{W}/cr/out")
     r = run("merge", "3", f"cat {r2}/h-*.bin", f"{W}/cr/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/cr/out", "2", ok=False)
     check("carriage-return junk in the index refused", r.returncode != 0)
-    r = run("names", f"{W}/crn.txt", ok=False, stdin="0\tcom.a\rjunk\t1\n")
+    r = run("names", f"{W}/crn.txt", f"{W}/crn.u32", ok=False, stdin="0\tcom.a\rjunk\t1\n")
     check("carriage return in a vertex name refused", r.returncode != 0)
     # review round 7: a NUL byte never ends a field early; checkidx validates a whole index
-    r = run("names", f"{W}/nul.txt", ok=False, stdin="0\tcom.a\0junk\t1\n")
+    r = run("names", f"{W}/nul.txt", f"{W}/nul.u32", ok=False, stdin="0\tcom.a\0junk\t1\n")
     check("NUL in a vertex name refused", r.returncode != 0)
     os.makedirs(f"{W}/nul/src"); [shutil.copy(f"{r2}/{x}", f"{W}/nul/src/{x}") for x in os.listdir(r2)]
     raw = open(f"{W}/nul/src/history.idx", "rb").read().split(b"\n"); raw[0] = raw[0] + b"\0junk"
@@ -263,9 +272,9 @@ def body():
     r = run("dictmerge", f"{W}/cr1.txt", f"{W}/cr2.txt", f"{W}/crout.txt", f"{W}/m1", f"{W}/m2", ok=False)
     check("carriage return in dictmerge input refused", r.returncode != 0)
     for bad_v in ("0\tcom.a\t1x\n", "0\tcom.a\t1\textra\n", "0\tcom.a\t\n", "0\tcom.a\t1\r\n"):
-        r = run("names", f"{W}/bv.txt", ok=False, stdin=bad_v)
+        r = run("names", f"{W}/bv.txt", f"{W}/bv.u32", ok=False, stdin=bad_v)
         check(f"vertex line {bad_v!r} refused", r.returncode != 0)
-    good_v = run("names", f"{W}/gv.txt", ok=False, stdin="0\tcom.a\t1\n1\tcom.b\n")
+    good_v = run("names", f"{W}/gv.txt", f"{W}/gv.u32", ok=False, stdin="0\tcom.a\t1\n1\tcom.b\n")
     check("vertex lines with and without the host count accepted", good_v.returncode == 0, good_v.stderr.strip()[:60])
     lines = open(f"{r2}/history.idx").read().splitlines()
     bad = list(lines); i = next(k for k, l in enumerate(bad) if l and not l.startswith("#"))
@@ -303,7 +312,7 @@ def body():
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"
     open(unsorted_edges, "w").write("".join(f"{a}\t{b}\n" for a, b in reversed(edges)))
-    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{W}/x.bin", f"cat {unsorted_edges}", ok=False)
+    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", f"cat {unsorted_edges}", ok=False)
     check("edges not sorted by source refused", r.returncode != 0)
 
     print(f"{len(ref)} links, {len(gl)} domains, {shards} shards")

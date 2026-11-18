@@ -20,6 +20,8 @@ ref = {}
 for ri in range(3):
     R = f"cc-main-20{19 + ri}-test"
     names = sorted(random.sample(universe, random.randint(200, 320)))
+    if ri == 1:
+        random.shuffle(names)                 # listed out of byte order, like Common Crawl's 2018 releases
     edges = sorted({(random.randrange(len(names)), random.randrange(len(names))) for _ in range(2500)})
     edges = [(a, b) for a, b in edges if a != b]
     d = f"{T}/cc/{R}/domain"; os.makedirs(d)

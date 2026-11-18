@@ -3,13 +3,16 @@
 // Our own code, standard C only (no outside libraries). Built for a 16 GB / 14 GB-disk runner: the link file is
 // streamed twice instead of stored, and the history is streamed in and out shard by shard.
 //
-//   lg names OUT                    stdin: Common Crawl vertices "id<TAB>rev_name[<TAB>...]" -> OUT, one name a line.
-//                                   Refuses ids that skip or names that are not in strictly increasing byte order.
+//   lg names OUT ORDER              stdin: Common Crawl vertices "id<TAB>rev_name[<TAB>hosts]" -> OUT, the names in
+//                                   byte order, one a line, and ORDER (u32: the release id at each sorted position).
+//                                   Refuses ids that skip and duplicate names; accepts any input order.
 //   lg dictmerge OLD|- REL NEW MAP_OLD MAP_REL
 //                                   Union of two sorted name lists -> NEW (+ NEW.idx), and u32 maps old->new, rel->new.
-//   lg inbound N E MAP_REL OUT CMD  Runs CMD twice (it must print the release's "from<TAB>to" edges, sorted by from).
+//   lg inbound N E MAP_REL ORDER OUT CMD
+//                                   Runs CMD twice (it must print the release's "from<TAB>to" edges, sorted by from).
 //                                   Pass 1 counts, pass 2 places: "who links to X" in ~8 bytes a node + 4 a link.
-//                                   OUT: records (target, count, sources) in global ids, targets ascending.
+//                                   MAP_REL maps sorted positions to global ids, ORDER sorted positions to release ids.
+//                                   OUT: records (target, count, sources) in global ids, targets and sources ascending.
 //   lg merge REL_INDEX PREVCMD|- PREVIDX|- MAP_OLD REL OUTDIR SHARD_KB [ON_SHARD]
 //                                   Folds a release (lg inbound OUT) into the history. PREVCMD prints the previous
 //                                   history's shards in order; PREVIDX is that history's index. REL_INDEX must be
@@ -122,11 +125,20 @@ static void save_u32(const char *path, const uint32_t *a, uint64_t n) {
 }
 
 // ---------- names ----------
-static int cmd_names(const char *out) {
-  FILE *o = xopen(out, "wb"); char *line = NULL, *prev = NULL; size_t cap = 0, pcap = 0; ssize_t len; uint64_t want = 0;
+// Names in byte order, whatever order the release lists them in (Common Crawl's 2018 releases sort "ac.2-yr" before
+// "ac.2"; the 2026 ones use plain byte order). All names are held in one buffer, sorted, checked unique, then written
+// sorted, with ORDER = for each sorted position, the release's own id at that position (u32).
+static const char *g_names; static const uint64_t *g_noff;
+static int cmp_name(const void *a, const void *b) {
+  return strcmp(g_names + g_noff[*(const uint32_t *)a], g_names + g_noff[*(const uint32_t *)b]);
+}
+static int cmd_names(const char *out, const char *orderp) {
+  char *line = NULL; size_t cap = 0; ssize_t len; uint64_t want = 0;
+  size_t bcap = 1 << 24, blen = 0; char *buf = xmalloc(bcap);
+  uint64_t ocap = 1 << 20; uint64_t *noff = xmalloc(ocap * 8);
   while ((len = gline(&line, &cap, stdin)) > 0) {
     char *t1 = strchr(line, '\t'); if (!t1) die("vertex line without a tab");
-    *t1 = 0; uint64_t id = num(line, UINT32_MAX, "vertex id");
+    *t1 = 0; uint64_t id = num(line, UINT32_MAX - 1, "vertex id");
     if (id != want) { fprintf(stderr, "lg: vertex id %llu where %llu expected\n", (unsigned long long)id, (unsigned long long)want); exit(3); }
     char *name = t1 + 1; size_t nl = strcspn(name, "\t\n");
     // what follows the name must be nothing, or one tab and digits (Common Crawl's host count), then the newline
@@ -135,12 +147,23 @@ static int cmd_names(const char *out) {
       if (*rest) die("bad vertex line"); }
     name[nl] = 0;
     if (!nl) die("empty vertex name");
-    if (prev && strcmp(prev, name) >= 0) { fprintf(stderr, "lg: names not strictly increasing at id %llu\n", (unsigned long long)id); exit(3); }
-    if (nl + 1 > pcap) { pcap = nl + 64; prev = xrealloc(prev, pcap); }
-    memcpy(prev, name, nl + 1);
-    fwrite(name, 1, nl, o); fputc('\n', o); want++;
+    if (blen + nl + 1 > bcap) { while (blen + nl + 1 > bcap) bcap *= 2; buf = xrealloc(buf, bcap); }
+    if (want == ocap) { ocap *= 2; noff = xrealloc(noff, ocap * 8); }
+    noff[want] = blen; memcpy(buf + blen, name, nl + 1); blen += nl + 1; want++;
+  }
+  uint32_t *ord = xmalloc(want * 4);
+  for (uint64_t i = 0; i < want; i++) ord[i] = (uint32_t)i;
+  g_names = buf; g_noff = noff;
+  qsort(ord, want, 4, cmp_name);
+  FILE *o = xopen(out, "wb");
+  for (uint64_t i = 0; i < want; i++) {
+    const char *nm = buf + noff[ord[i]];
+    if (i > 0 && strcmp(buf + noff[ord[i - 1]], nm) == 0) die("duplicate vertex name");
+    fputs(nm, o); fputc('\n', o);
   }
   if (fclose(o)) die("close failed");
+  save_u32(orderp, ord, want);
+  free(buf); free(noff); free(ord);
   printf("{\"names\": %llu}\n", (unsigned long long)want); return 0;
 }
 
@@ -183,9 +206,17 @@ static int cmd_dictmerge(const char *oldp, const char *relp, const char *newp, c
 }
 
 // ---------- inbound ----------
-static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *outp, const char *cmd) {
-  uint64_t nm; uint32_t *map = load_u32(maprelp, &nm);
-  if (nm != N) die("release map size differs from the node count");
+static int cmp_u32(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *orderp, const char *outp, const char *cmd) {
+  uint64_t nm, no; uint32_t *bypos = load_u32(maprelp, &nm), *ord = load_u32(orderp, &no);
+  if (nm != N || no != N) die("release map or order size differs from the node count");
+  uint32_t *map = xmalloc(N * 4); uint8_t *seen = xcalloc(N, 1);
+  for (uint64_t p = 0; p < N; p++) {   // map[release id] = global id; ORDER must be a permutation of 0..N-1
+    if (ord[p] >= N || seen[ord[p]]) die("release order is not a permutation");
+    seen[ord[p]] = 1; map[ord[p]] = bypos[p];
+    if (p > 0 && bypos[p] <= bypos[p - 1]) die("release map not ascending");
+  }
+  free(seen); free(bypos);
   uint32_t *indeg = xcalloc(N, 4); uint64_t a, b, e1 = 0, prev = 0, h1[2] = {1, 2}, h2[2] = {1, 2};
   FILE *p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
   while (edge_line(p, &a, &b)) {
@@ -215,11 +246,13 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
   off[0] = 0;
   if (off[N] != E) die("inbound offsets do not add up");
   FILE *o = xopen(outp, "wb"); uint64_t bytes = 0, targets = 0;
-  for (uint64_t v = 0; v < N; v++) {
-    uint64_t s = off[v], t = off[v + 1]; if (s == t) continue;
+  for (uint64_t k = 0; k < E; k++) src[k] = map[src[k]];   // sources to global ids, then each target's list sorted
+  for (uint64_t p = 0; p < N; p++) {                        // targets in global order = sorted-position order
+    uint64_t v = ord[p], s = off[v], t = off[v + 1]; if (s == t) continue;
+    qsort(src + s, t - s, 4, cmp_u32);
     targets++; vput(o, map[v], &bytes); vput(o, t - s, &bytes);
     uint64_t ps = 0;
-    for (uint64_t k = s; k < t; k++) { uint64_t g = map[src[k]]; if (k > s && g <= ps) die("sources not ascending"); vput(o, g - ps, &bytes); ps = g; }
+    for (uint64_t k = s; k < t; k++) { uint64_t g = src[k]; if (k > s && g <= ps) die("duplicate edge"); vput(o, g - ps, &bytes); ps = g; }
   }
   if (fclose(o)) die("close failed");
   printf("{\"nodes\": %llu, \"edges\": %llu, \"targets\": %llu, \"bytes\": %llu}\n",
@@ -472,9 +505,9 @@ static int cmd_lookup(const char *dir, const char *namesp, const char *domain) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 3 && !strcmp(argv[1], "names")) return cmd_names(argv[2]);
+  if (argc == 4 && !strcmp(argv[1], "names")) return cmd_names(argv[2], argv[3]);
   if (argc == 7 && !strcmp(argv[1], "dictmerge")) return cmd_dictmerge(argv[2], argv[3], argv[4], argv[5], argv[6]);
-  if (argc == 7 && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6]);
+  if (argc == 8 && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6], argv[7]);
   if ((argc == 9 || argc == 10) && !strcmp(argv[1], "merge")) return cmd_merge((int)num(argv[2], 254, "REL_INDEX"), argv[3], argv[4], argv[5], argv[6], argv[7], num(argv[8], 1ULL << 24, "SHARD_KB"), argc == 10 ? argv[9] : NULL);
   if (argc == 3 && !strcmp(argv[1], "checkidx")) {   // full validation of a history index; prints its release
     int rel; uint64_t sh, *rc, *by; read_idx_head(argv[2], &rel, &sh, &rc, &by, NULL);
