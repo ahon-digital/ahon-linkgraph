@@ -10,7 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def load():
-    os.environ.update(HF_TOKEN="hf_test_value", LG_REPO="org/name")
+    os.environ.update(HF_TOKEN="hf_testvalue", LG_REPO="org/name")
     spec = importlib.util.spec_from_file_location("hf", os.path.join(HERE, "..", "scripts", "hf.py"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
@@ -68,6 +68,28 @@ def test_download_without_hash_refused():
     except SystemExit:
         accepted = False
     assert not accepted
+
+
+def test_malformed_token_never_printed():
+    import subprocess
+    secret = "hf_abc\ndefsecretpart"
+    r = subprocess.run([sys.executable, os.path.join(HERE, "..", "scripts", "hf.py"), "squash"],
+                       env=dict(os.environ, HF_TOKEN=secret, LG_REPO="org/name"), capture_output=True, text=True)
+    assert r.returncode != 0 and "defsecretpart" not in r.stdout + r.stderr
+    assert "not a well-formed" in r.stderr   # refused up front, before any request is built
+
+
+def test_exception_text_scrubbed():
+    hf = load()
+    def boom(r, timeout=0):
+        raise ValueError("Invalid header value b'Bearer hf_leakedvalue\\n'")
+    hf.OPENER.open = boom
+    try:
+        hf.req("GET", "https://huggingface.co/api/x")
+        msg = ""
+    except SystemExit as e:
+        msg = str(e)
+    assert msg and "leakedvalue" not in msg
 
 
 if __name__ == "__main__":

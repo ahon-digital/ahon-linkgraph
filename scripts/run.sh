@@ -17,7 +17,6 @@ log() { echo "== $(date -u +%FT%TZ) $*"; }
 
 log "release list"
 if [ -n "${LG_RELEASE_LIST:-}" ]; then cp "$LG_RELEASE_LIST" all.txt; else python3 "$here/releases.py" > all.txt; fi
-python3 "$here/hf.py" ensure
 rc=0; python3 "$here/hf.py" get releases.tsv done.tsv || rc=$?
 if [ "$rc" = 3 ]; then : > done.tsv; elif [ "$rc" != 0 ]; then echo "cannot read the release log"; exit 1; fi
 n_done=$(grep -c . done.tsv || true)
@@ -50,6 +49,8 @@ log "inbound (two streamed passes)"
 rm -f map_rel.u32
 
 log "merge into history"
+# the dataset is created only here: past the "nothing to do" exit and never on a dry run (shards upload during merge)
+[ "${LG_DRY:-0}" = 1 ] || python3 "$here/hf.py" ensure
 rm -rf hist manifest.tsv; mkdir hist; : > manifest.tsv
 if [ "$RI" = 0 ]; then PREV=-; PREVIDX=-; else
   python3 "$here/hf.py" get history/history.idx prev.idx

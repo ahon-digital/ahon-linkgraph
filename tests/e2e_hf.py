@@ -5,7 +5,7 @@ nothing, downloads the published history and compares every link with the refere
 
     HF_TOKEN=... python3 tests/e2e_hf.py ./lg ahon-digital/linkgraph-e2e
 """
-import gzip, json, os, random, shutil, subprocess, sys, tempfile, urllib.request
+import gzip, json, os, random, shutil, subprocess, sys, tempfile, urllib.error, urllib.request
 
 LG, REPO = os.path.abspath(sys.argv[1]), sys.argv[2]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,7 +45,21 @@ def step(i):
 
 
 shutil.copy(LG, ROOT + "/lg") if os.path.abspath(LG) != os.path.abspath(ROOT + "/lg") else None
+def exists():
+    r = urllib.request.Request(f"https://huggingface.co/api/datasets/{REPO}", headers={"Authorization": "Bearer " + os.environ["HF_TOKEN"]})
+    try:
+        urllib.request.urlopen(r, timeout=60); return True
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 404): return False
+        raise
+
+
 try:
+    p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=f"{T}/dry", LG_DRY="1"), capture_output=True, text=True)
+    if p.returncode or "uploaded nothing" not in p.stdout:
+        fails.append("dry run failed"); print(p.stdout[-800:], p.stderr[-800:])
+    if exists():
+        fails.append("dry run created the dataset")
     for i in range(3):
         out, _ = step(i)
         if f"next: {names_list[i]}" not in out:
@@ -80,7 +94,7 @@ try:
         fails.append(f"published history differs: {len(got)} vs {len(ref)} links")
     print(json.dumps({"releases": len(rel), "links": len(got), "shards": len(local_shards), "fails": fails}))
 finally:
-    urllib.request.urlopen(urllib.request.Request(f"https://huggingface.co/api/repos/delete", method="DELETE",
+    if exists(): urllib.request.urlopen(urllib.request.Request(f"https://huggingface.co/api/repos/delete", method="DELETE",
         data=json.dumps({"type": "dataset", "name": REPO.split("/")[1], "organization": REPO.split("/")[0]}).encode(),
         headers={"Authorization": "Bearer " + os.environ["HF_TOKEN"], "Content-Type": "application/json"}), timeout=60)
     if os.path.exists(ROOT + "/lg") and os.path.abspath(LG) != os.path.abspath(ROOT + "/lg"):

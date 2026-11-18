@@ -180,6 +180,7 @@ def body():
     os.makedirs(f"{W}/forged/src"); [shutil.copy(f"{r2}/{x}", f"{W}/forged/src/{x}") for x in os.listdir(r2)]
     shl = sorted(x for x in os.listdir(r2) if x.startswith("h-"))[-1]
     data = open(f"{W}/forged/src/{shl}", "rb").read(); n = struct.unpack("<Q", data[4:12])[0]; pos = 12
+
     def varint(p):
         v = sh = 0
         while True:
@@ -194,6 +195,26 @@ def body():
     os.makedirs(f"{W}/forged/out")
     r = run("merge", "3", f"cat {W}/forged/src/h-*.bin", f"{W}/forged/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/forged/out", "2", ok=False)
     check("shard count rewritten without the index refused", r.returncode != 0, r.stderr.strip()[:80])
+    # review round 3: a record shortened inside a shard (its link count lowered, its last link's bytes cut, the
+    # shard's record count untouched) must be refused by the index's byte count
+    os.makedirs(f"{W}/short2/src"); [shutil.copy(f"{r2}/{x}", f"{W}/short2/src/{x}") for x in os.listdir(r2)]
+    data = open(f"{W}/short2/src/{shl}", "rb").read(); pos = 12; n = struct.unpack("<Q", data[4:12])[0]
+    for _ in range(n - 1):
+        _, pos = varint(pos); cnt, pos = varint(pos)
+        for _ in range(cnt):
+            _, pos = varint(pos); pos += 2
+    _, p1 = varint(pos); cnt, p2 = varint(p1)
+    if cnt >= 2 and cnt < 128:
+        q = p2
+        for _ in range(cnt - 1):
+            _, q = varint(q); q += 2
+        cut = data[:p1] + bytes([cnt - 1]) + data[p2:q]           # one link fewer, record count unchanged
+        open(f"{W}/short2/src/{shl}", "wb").write(cut)
+        os.makedirs(f"{W}/short2/out")
+        r = run("merge", "3", f"cat {W}/short2/src/h-*.bin", f"{W}/short2/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/short2/out", "2", ok=False)
+        check("record shortened inside a shard refused", r.returncode != 0, r.stderr.strip()[:80])
+    else:
+        check("fixture: last record has 2..127 links", False, str(cnt))
     idx_lines = open(f"{r2}/history.idx").read().splitlines()
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"

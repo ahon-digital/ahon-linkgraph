@@ -16,10 +16,13 @@ Nothing here prints the token. Request bodies and logs carry paths, sizes and co
 import hashlib, json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 H = "https://huggingface.co"
-TOKEN = os.environ.get("HF_TOKEN", "")
+TOKEN = os.environ.get("HF_TOKEN", "").strip()
 REPO = os.environ.get("LG_REPO", "")
 if not TOKEN or not REPO:
     sys.exit("hf.py: HF_TOKEN and LG_REPO are required")
+# A token with anything but token characters would end up inside an error message; refuse it without echoing it.
+if not TOKEN.startswith("hf_") or not TOKEN[3:].isalnum():
+    sys.exit("hf.py: HF_TOKEN is not a well-formed Hugging Face token (value not shown)")
 ORG, NAME = REPO.split("/", 1)
 
 
@@ -60,7 +63,9 @@ def req(method, url, data=None, headers=None, stream=False, timeout=300, tries=4
             if attempt < tries - 1:
                 time.sleep(15 * (attempt + 1))
                 continue
-            raise SystemExit(f"hf.py: network failure on {method} {url.split('?')[0]}: {e}")
+            raise SystemExit(f"hf.py: network failure on {method} {url.split('?')[0]}: {type(e).__name__}")
+        except Exception as e:   # never let an exception text that may quote headers reach the log
+            raise SystemExit(f"hf.py: request failed on {method} {url.split('?')[0]}: {type(e).__name__}")
 
 
 def jsonbody(b):
