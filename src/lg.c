@@ -46,9 +46,14 @@ static uint64_t num(const char *s, uint64_t max, const char *what) {
 }
 // Splits a tab-separated index line into at most n strict numbers; returns how many fields it had.
 static int fields(char *line, uint64_t *out, int n, uint64_t max, const char *what) {
-  line[strcspn(line, "\r\n")] = 0; int k = 0; char *save = NULL;
-  for (char *t = strtok_r(line, "\t", &save); t; t = strtok_r(NULL, "\t", &save)) { if (k == n) return n + 1; out[k++] = num(t, max, what); }
-  return k;
+  line[strcspn(line, "\r\n")] = 0; int k = 0; char *t = line;
+  for (;;) {
+    char *tab = strchr(t, '\t'); if (tab) *tab = 0;
+    if (k == n) return n + 1;
+    out[k++] = num(t, max, what);      // num() refuses an empty field
+    if (!tab) return k;
+    t = tab + 1;
+  }
 }
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("out of memory"); return p; }
 static void *xcalloc(size_t n, size_t s) { void *p = calloc(n ? n : 1, s); if (!p) die("out of memory"); return p; }
@@ -61,6 +66,7 @@ static int vget(FILE *f, uint64_t *x) {   // 1 ok, 0 clean end before the first 
   for (;;) {
     c = getc(f);
     if (c == EOF) { if (sh == 0) return 0; die("truncated varint"); }
+    if (sh == 63 && c > 1) die("varint overflow");
     v |= (uint64_t)(c & 127) << sh;
     if (c < 128) break;
     sh += 7; if (sh > 63) die("bad varint");
@@ -76,11 +82,19 @@ static uint64_t mix64(uint64_t z) {   // splitmix64 finaliser
 // Order-dependent fingerprint of the edge stream: two independent chained 64-bit lanes. A second pass must equal the
 // first edge for edge, in the same order.
 static void fp_add(uint64_t h[2], uint64_t a, uint64_t b) { uint64_t e = (a << 32) | b; h[0] = mix64(h[0] ^ e); h[1] = mix64(h[1] + mix64(e ^ 0xD6E8FEB86659FD93ULL)); }
-static int rdu(FILE *f, uint64_t *x) {    // next unsigned integer in text; 0 at end
-  int c; do { c = getc_unlocked(f); if (c == EOF) return 0; } while (c < '0' || c > '9');
-  uint64_t v = 0;
-  while (c >= '0' && c <= '9') { if (v > 100000000000ULL) die("number too large in the edge stream"); v = v * 10 + (uint64_t)(c - '0'); c = getc_unlocked(f); }
-  *x = v; return 1;
+// One edge line, exactly "digits<TAB>digits<LF>" (the last line may lack the LF). 1 = an edge, 0 = clean end.
+// Anything else stops: a sign, a space, an empty field, a third field, or a number past 10^11.
+static int edge_line(FILE *f, uint64_t *a, uint64_t *b) {
+  int c = getc_unlocked(f);
+  if (c == EOF) return 0;
+  for (int k = 0; k < 2; k++) {
+    uint64_t v = 0; int digits = 0;
+    while (c >= '0' && c <= '9') { if (v > 100000000000ULL) die("number too large in the edge stream"); v = v * 10 + (uint64_t)(c - '0'); digits++; c = getc_unlocked(f); }
+    if (!digits) die("malformed edge line");
+    if (k == 0) { if (c != '\t') die("malformed edge line"); *a = v; c = getc_unlocked(f); }
+    else { if (c != '\n' && c != EOF) die("malformed edge line"); *b = v; }
+  }
+  return 1;
 }
 
 static uint32_t *load_u32(const char *path, uint64_t *n) {
@@ -98,8 +112,8 @@ static int cmd_names(const char *out) {
   FILE *o = xopen(out, "wb"); char *line = NULL, *prev = NULL; size_t cap = 0, pcap = 0; ssize_t len; uint64_t want = 0;
   while ((len = getline(&line, &cap, stdin)) > 0) {
     char *t1 = strchr(line, '\t'); if (!t1) die("vertex line without a tab");
-    *t1 = 0; char *end; uint64_t id = strtoull(line, &end, 10);
-    if (*end || id != want) { fprintf(stderr, "lg: vertex id %llu where %llu expected\n", (unsigned long long)id, (unsigned long long)want); exit(3); }
+    *t1 = 0; uint64_t id = num(line, UINT32_MAX, "vertex id");
+    if (id != want) { fprintf(stderr, "lg: vertex id %llu where %llu expected\n", (unsigned long long)id, (unsigned long long)want); exit(3); }
     char *name = t1 + 1; size_t nl = strcspn(name, "\t\r\n"); name[nl] = 0;
     if (!nl) die("empty vertex name");
     if (prev && strcmp(prev, name) >= 0) { fprintf(stderr, "lg: names not strictly increasing at id %llu\n", (unsigned long long)id); exit(3); }
@@ -155,8 +169,7 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
   if (nm != N) die("release map size differs from the node count");
   uint32_t *indeg = xcalloc(N, 4); uint64_t a, b, e1 = 0, prev = 0, h1[2] = {1, 2}, h2[2] = {1, 2};
   FILE *p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
-  while (rdu(p, &a)) {
-    if (!rdu(p, &b)) die("odd number of integers in the edge stream");
+  while (edge_line(p, &a, &b)) {
     if (a >= N || b >= N) die("edge id out of range");
     if (a < prev) die("edges are not sorted by source");
     prev = a; indeg[b]++; e1++; fp_add(h1, a, b);
@@ -168,8 +181,7 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
   free(indeg);
   uint32_t *src = xmalloc(E * 4); uint64_t e2 = 0; prev = 0;
   p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
-  while (rdu(p, &a)) {
-    if (!rdu(p, &b)) die("odd number of integers in the edge stream");
+  while (edge_line(p, &a, &b)) {
     if (a >= N || b >= N) die("edge id out of range");
     if (e2 >= E) die("pass 2 read more edges than pass 1");
     if (a < prev) die("edges are not sorted by source (pass 2)");
@@ -205,7 +217,7 @@ typedef struct { FILE *f; uint64_t left, shards, used; const uint64_t *want, *wa
 static int hgetc(HistIn *h) { int c = getc(h->f); if (c == EOF) die("truncated record"); h->used++; return c; }
 static uint64_t hvar(HistIn *h) {
   uint64_t v = 0; int sh = 0, c;
-  for (;;) { c = hgetc(h); v |= (uint64_t)(c & 127) << sh; if (c < 128) return v; sh += 7; if (sh > 63) die("bad varint"); }
+  for (;;) { c = hgetc(h); if (sh == 63 && c > 1) die("varint overflow"); v |= (uint64_t)(c & 127) << sh; if (c < 128) return v; sh += 7; if (sh > 63) die("bad varint"); }
 }
 static void hist_shard_done(HistIn *h) {   // the shard just finished must have exactly the bytes the index records
   if (h->wantb && h->shards > 0 && h->used != h->wantb[h->shards - 1]) die("a history shard's size differs from the index");
@@ -221,9 +233,12 @@ static int hist_next(HistIn *h, Rec *r) {
     if (h->want) { if (h->shards >= h->nwant || c != h->want[h->shards]) die("a history shard's record count differs from the index"); }
     h->left = c; h->shards++; h->used = 12;
   }
-  r->tgt = hvar(h); r->n = hvar(h); rec_room(r, r->n);
+  r->tgt = hvar(h); if (r->tgt > UINT32_MAX) die("bad target id in history"); r->n = hvar(h); rec_room(r, r->n);
   uint64_t ps = 0;
-  for (uint64_t k = 0; k < r->n; k++) { ps += hvar(h); if (ps > UINT32_MAX) die("source id too large"); r->src[k] = (uint32_t)ps; r->first[k] = (uint8_t)hgetc(h); r->last[k] = (uint8_t)hgetc(h); }
+  for (uint64_t k = 0; k < r->n; k++) {
+    uint64_t d = hvar(h); if (d > UINT32_MAX - ps || (k > 0 && d == 0)) die("bad source id in history");
+    ps += d; r->src[k] = (uint32_t)ps; r->first[k] = (uint8_t)hgetc(h); r->last[k] = (uint8_t)hgetc(h);
+  }
   h->left--; return 1;
 }
 
@@ -299,7 +314,7 @@ static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const cha
   uint64_t links = 0, fresh = 0, again = 0, carried = 0, targets = 0, prev_t = 0; int have_prev_t = 0;
   int hh = hist_next(&h, &hp);
   uint64_t rt = 0, rn = 0; int hr = vget(rf, &rt);
-  if (hr) rn = vneed(rf);
+  if (hr) { rn = vneed(rf); if (rt > UINT32_MAX) die("bad target id in release"); }
   #define REMAP_PREV() do { if (hp.tgt >= nmo) die("history id outside the old map"); hp.tgt = mo[hp.tgt]; \
       for (uint64_t k = 0; k < hp.n; k++) { if (hp.src[k] >= nmo) die("history id outside the old map"); hp.src[k] = mo[hp.src[k]]; } } while (0)
   if (hh) REMAP_PREV();
@@ -309,7 +324,7 @@ static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const cha
     if (have_prev_t && out.tgt <= prev_t) die("targets not ascending");
     prev_t = out.tgt; have_prev_t = 1;
     rec_room(&rr, take_r ? rn : 0); rr.n = 0;
-    if (take_r) { uint64_t ps = 0; for (uint64_t k = 0; k < rn; k++) { ps += vneed(rf); if (ps > UINT32_MAX) die("id too large"); rr.src[k] = (uint32_t)ps; } rr.n = rn; }
+    if (take_r) { uint64_t ps = 0; for (uint64_t k = 0; k < rn; k++) { uint64_t d = vneed(rf); if (d > UINT32_MAX - ps || (k > 0 && d == 0)) die("bad source id in release"); ps += d; rr.src[k] = (uint32_t)ps; } rr.n = rn; }
     uint64_t i = 0, j = 0, hn = take_h ? hp.n : 0;
     rec_room(&out, hn + rr.n);
     while (i < hn || j < rr.n) {
@@ -322,7 +337,7 @@ static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const cha
     }
     hist_put(&w, &out); targets++; links += out.n;
     if (take_h) { hh = hist_next(&h, &hp); if (hh) REMAP_PREV(); }
-    if (take_r) { hr = vget(rf, &rt); if (hr) rn = vneed(rf); }
+    if (take_r) { hr = vget(rf, &rt); if (hr) { rn = vneed(rf); if (rt > UINT32_MAX) die("bad target id in release"); } }
   }
   if (h.f && h.left == 0) { Rec tail = {0}; if (hist_next(&h, &tail)) die("previous history has records past its index"); }
   if (h.f && (h.left != 0 || h.shards != want_shards)) {
@@ -344,8 +359,12 @@ static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const cha
 // ---------- readers ----------
 static int rec_read(FILE *f, Rec *r) {   // one record without a shard header; 0 at clean end of file
   uint64_t t; if (!vget(f, &t)) return 0;
+  if (t > UINT32_MAX) die("bad target id in history");
   r->tgt = t; r->n = vneed(f); rec_room(r, r->n); uint64_t ps = 0;
-  for (uint64_t k = 0; k < r->n; k++) { ps += vneed(f); r->src[k] = (uint32_t)ps; r->first[k] = (uint8_t)bget(f); r->last[k] = (uint8_t)bget(f); }
+  for (uint64_t k = 0; k < r->n; k++) {
+    uint64_t d = vneed(f); if (d > UINT32_MAX - ps || (k > 0 && d == 0)) die("bad source id in history");
+    ps += d; r->src[k] = (uint32_t)ps; r->first[k] = (uint8_t)bget(f); r->last[k] = (uint8_t)bget(f);
+  }
   return 1;
 }
 typedef struct { char **s; uint64_t n; } Names;

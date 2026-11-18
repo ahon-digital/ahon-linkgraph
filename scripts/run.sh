@@ -24,14 +24,18 @@ rel_rc=$(st python3 "$here/hf.py" get releases.tsv done.tsv)
 idx_rc=$(st python3 "$here/hf.py" get history/history.idx prev.idx)
 dom_rc=$(st python3 "$here/hf.py" exists domains.txt)
 for v in "$rel_rc" "$idx_rc" "$dom_rc"; do case "$v" in 0|3) ;; *) echo "cannot read the dataset's state: stop"; exit 1;; esac; done
-if [ "$rel_rc" = 3 ]; then
-  [ "$idx_rc" = 3 ] && [ "$dom_rc" = 3 ] || { echo "dataset holds history but no release log: stop"; exit 1; }
+# Exactly two valid states: nothing at all (fresh start), or all three present and agreeing. We never write an
+# empty release log, so an empty one is as broken as a missing one.
+if [ "$rel_rc" = 3 ] && [ "$idx_rc" = 3 ] && [ "$dom_rc" = 3 ]; then
   : > done.tsv
+elif [ "$rel_rc" = 0 ] && [ "$idx_rc" = 0 ] && [ "$dom_rc" = 0 ]; then
+  [ -s done.tsv ] || { echo "release log is empty next to an existing history: stop"; exit 1; }
+else
+  echo "dataset is partial (release log $rel_rc, history $idx_rc, domains $dom_rc; 0 = present): stop"; exit 1
 fi
 n_done=$(grep -c . done.tsv || true)
 awk -F'\t' -v n="$n_done" '$1 != NR - 1 { bad = 1 } END { exit bad || NR != n }' done.tsv || { echo "release log is not numbered 0..n-1: stop"; exit 1; }
 if [ "$n_done" -gt 0 ]; then
-  [ "$idx_rc" = 0 ] && [ "$dom_rc" = 0 ] || { echo "release log without history or domains: stop"; exit 1; }
   [ "$(head -1 prev.idx)" = "$(printf '#release\t%d' $((n_done - 1)))" ] || { echo "history index and release log disagree: stop"; exit 1; }
 fi
 # the history must be a prefix of Common Crawl's order; anything else stops the build instead of guessing

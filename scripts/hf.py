@@ -36,18 +36,21 @@ class _Redirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and not _hf(newurl):
-            new.remove_header("Authorization")
+            for k, v in list(new.header_items()):
+                if k.lower() in _SECRET_HEADERS or (TOKEN and TOKEN in str(v)):
+                    new.remove_header(k)
         return new
 
 
-OPENER = urllib.request.build_opener(_Redirect)
 _SECRET_HEADERS = {"authorization", "proxy-authorization", "cookie"}
+OPENER = urllib.request.build_opener(_Redirect)
 
 
 def safe_headers(url, extra):
     """Headers for a request to url. Credential headers from anyone else (for example an upload action in a
     server reply) are always dropped; our token is added only for huggingface.co."""
-    h = {k: v for k, v in (extra or {}).items() if k.lower() not in _SECRET_HEADERS}
+    # By value as well as by name: no header that contains the token goes anywhere but huggingface.co.
+    h = {k: v for k, v in (extra or {}).items() if k.lower() not in _SECRET_HEADERS and not (TOKEN and TOKEN in str(v))}
     if _hf(url):
         h["Authorization"] = "Bearer " + TOKEN
     return h

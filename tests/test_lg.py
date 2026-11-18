@@ -224,6 +224,20 @@ def body():
     open(f"{W}/wrap2/src/history.idx", "w").write("\n".join(lines) + "\n"); os.makedirs(f"{W}/wrap2/out")
     r = run("merge", "3", f"cat {r2}/h-*.bin", f"{W}/wrap2/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/wrap2/out", "2", ok=False)
     check("wrapping release in the index refused", r.returncode != 0)
+    # review round 5: the edge reader and every index field are strict
+    for bad_edge in ("-1\t0\n", "1 \t0\n", "1\t0\t5\n", "1\t\n", "\t1\n", "1\n"):
+        open(f"{W}/be.txt", "w").write(bad_edge)
+        r = run("inbound", "17", "1", ident, f"{W}/c.bin", f"cat {W}/be.txt", ok=False)
+        check(f"malformed edge {bad_edge!r} refused", r.returncode != 0)
+    os.makedirs(f"{W}/emptyf/src"); [shutil.copy(f"{r2}/{x}", f"{W}/emptyf/src/{x}") for x in os.listdir(r2)]
+    lines = open(f"{W}/emptyf/src/history.idx").read().splitlines(); lines[1] = lines[1].replace("\t", "\t\t", 1)
+    open(f"{W}/emptyf/src/history.idx", "w").write("\n".join(lines) + "\n"); os.makedirs(f"{W}/emptyf/out")
+    r = run("merge", "3", f"cat {r2}/h-*.bin", f"{W}/emptyf/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/emptyf/out", "2", ok=False)
+    check("empty index field refused", r.returncode != 0)
+    open(f"{W}/ovf.bin", "wb").write(bytes([0xff] * 9 + [0x7f, 1, 1]))   # a 10-byte varint past 2^64
+    os.makedirs(f"{W}/ovf")
+    r = run("merge", "0", "-", "-", f"{d}/map_old.u32", f"{W}/ovf.bin", f"{W}/ovf", "2", ok=False)
+    check("overflowing varint refused", r.returncode != 0)
     idx_lines = open(f"{r2}/history.idx").read().splitlines()
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"

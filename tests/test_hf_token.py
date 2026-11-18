@@ -110,6 +110,25 @@ def test_upload_reply_headers_cannot_carry_token_off_host():
     assert sent and all(hf.TOKEN not in str(h) for _, h in sent), sent
 
 
+def test_token_in_any_reply_header_stays_on_huggingface():
+    hf = load(); sent = []
+    import json as _j
+    hf.req = lambda method, url, data=None, headers=None, stream=False, timeout=0, tries=4: (200, _j.dumps({"objects": [{"actions": {
+        "upload": {"href": "https://storage.example/object", "header": {"X-Echo-Token": "x" + hf.TOKEN + "y"}}}}]}).encode())
+    class Ok:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    hf.OPENER.open = lambda r, timeout=0: (sent.append(dict(r.header_items())), Ok())[1]
+    import tempfile
+    f = tempfile.NamedTemporaryFile(delete=False); f.write(b"data"); f.close()
+    hf.put(f.name, "x.bin", f.name + ".manifest")
+    assert sent and all(hf.TOKEN not in str(h) for h in sent), sent
+    r = urllib.request.Request("https://huggingface.co/x", headers={"X-Echo-Token": hf.TOKEN, "Accept": "a"})
+    off = hf._Redirect().redirect_request(r, None, 302, "Found", {}, "https://storage.example/o")
+    assert off is not None and hf.TOKEN not in str(off.header_items()) and off.has_header("Accept")
+
+
 def _guard_output(fn):
     hf = load()
     import contextlib
