@@ -23,7 +23,8 @@
 // History shard: "LGH1", u64 record count, records. Record: varint target (absolute global id), varint count, then
 // count x (varint source delta, first-release byte, last-release byte); the first source delta is the absolute id.
 // history.idx: first line "#release<TAB>N" (the last release folded in), then "shard<TAB>offset<TAB>first_target" at
-// every shard start and about every 1 MB, for range reads.
+// every shard start and about every 1 MB, for range reads, then "#shard<TAB>n<TAB>records<TAB>bytes" for each shard.
+// A merge checks every shard it reads against those lines, so a shard cannot shrink without the index noticing.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,7 +61,8 @@ static uint64_t mix64(uint64_t z) {   // splitmix64 finaliser
 static void fp_add(uint64_t h[2], uint64_t a, uint64_t b) { uint64_t e = (a << 32) | b; h[0] = mix64(h[0] ^ e); h[1] = mix64(h[1] + mix64(e ^ 0xD6E8FEB86659FD93ULL)); }
 static int rdu(FILE *f, uint64_t *x) {    // next unsigned integer in text; 0 at end
   int c; do { c = getc_unlocked(f); if (c == EOF) return 0; } while (c < '0' || c > '9');
-  uint64_t v = 0; while (c >= '0' && c <= '9') { v = v * 10 + (uint64_t)(c - '0'); c = getc_unlocked(f); }
+  uint64_t v = 0;
+  while (c >= '0' && c <= '9') { if (v > 100000000000ULL) die("number too large in the edge stream"); v = v * 10 + (uint64_t)(c - '0'); c = getc_unlocked(f); }
   *x = v; return 1;
 }
 
@@ -182,7 +184,7 @@ typedef struct { uint64_t tgt, n, cap; uint32_t *src; uint8_t *first, *last; } R
 static void rec_room(Rec *r, uint64_t n) {
   if (n > r->cap) { r->cap = n + n / 2 + 16; r->src = xrealloc(r->src, r->cap * 4); r->first = xrealloc(r->first, r->cap); r->last = xrealloc(r->last, r->cap); }
 }
-typedef struct { FILE *f; uint64_t left, shards; } HistIn;   // records left in the current shard; shards opened
+typedef struct { FILE *f; uint64_t left, shards; const uint64_t *want; uint64_t nwant; } HistIn;   // records left in the current shard; shards opened; expected records per shard
 static int hist_next(HistIn *h, Rec *r) {
   if (!h->f) return 0;
   while (h->left == 0) {
@@ -190,6 +192,7 @@ static int hist_next(HistIn *h, Rec *r) {
     if (k == 0) return 0;
     if (k != 4 || memcmp(m, "LGH1", 4)) die("history shard header missing");
     uint64_t c; if (fread(&c, 8, 1, h->f) != 1) die("history shard header truncated");
+    if (h->want) { if (h->shards >= h->nwant || c != h->want[h->shards]) die("a history shard's record count differs from the index"); }
     h->left = c; h->shards++;
   }
   r->tgt = vneed(h->f); r->n = vneed(h->f); rec_room(r, r->n);
@@ -199,11 +202,13 @@ static int hist_next(HistIn *h, Rec *r) {
 }
 
 // ---------- history writing ----------
-typedef struct { const char *dir, *on_shard; uint64_t limit, bytes, recs, block_at, shard, total_bytes; FILE *f, *idx; off_t hdr; char path[4096]; } HistOut;
+typedef struct { const char *dir, *on_shard; uint64_t limit, bytes, recs, block_at, shard, total_bytes; FILE *f, *idx; off_t hdr; char path[4096]; uint64_t *srec, *sbytes, scap; } HistOut;
 static void hist_close(HistOut *w) {
   if (!w->f) return;
   fseeko(w->f, w->hdr + 4, SEEK_SET); fwrite(&w->recs, 8, 1, w->f);
-  if (fclose(w->f)) die("close failed"); w->f = NULL; w->shard++;
+  if (fclose(w->f)) die("close failed"); w->f = NULL;
+  if (w->shard >= w->scap) { w->scap = w->scap ? w->scap * 2 : 64; w->srec = xrealloc(w->srec, w->scap * 8); w->sbytes = xrealloc(w->sbytes, w->scap * 8); }
+  w->srec[w->shard] = w->recs; w->sbytes[w->shard] = w->bytes; w->shard++;
   if (w->on_shard) {
     char q[8300]; size_t o = 0; q[o++] = '\'';   // single-quote the path, escaping any quote inside it
     for (const char *s = w->path; *s; s++) { if (o + 6 >= sizeof q) die("path too long"); if (*s == '\'') { memcpy(q + o, "'\\''", 4); o += 4; } else q[o++] = *s; }
@@ -232,21 +237,28 @@ static void hist_put(HistOut *w, const Rec *r) {
 }
 
 // Reads a history index: the release it was built through and how many distinct shards it lists.
-static void read_idx_head(const char *p, int *release, uint64_t *shards) {
-  FILE *f = xopen(p, "rb"); char line[512]; uint64_t sh, o, t, last = UINT64_MAX; *shards = 0;
+static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_t **recs) {
+  FILE *f = xopen(p, "rb"); char line[512]; uint64_t sh, o, t, last = UINT64_MAX, n, rc, by, nrec = 0; *shards = 0;
+  *recs = xmalloc(8 * 64); uint64_t cap = 64;
   if (!fgets(line, sizeof line, f) || sscanf(line, "#release\t%d", release) != 1) die("history index has no #release line");
   while (fgets(line, sizeof line, f)) {
+    if (!strncmp(line, "#shard\t", 7)) {
+      if (sscanf(line, "#shard\t%llu\t%llu\t%llu", (unsigned long long *)&n, (unsigned long long *)&rc, (unsigned long long *)&by) != 3 || n != nrec) die("bad #shard line in the history index");
+      if (nrec == cap) { cap *= 2; *recs = xrealloc(*recs, cap * 8); }
+      (*recs)[nrec++] = rc; continue;
+    }
     if (sscanf(line, "%llu\t%llu\t%llu", (unsigned long long *)&sh, (unsigned long long *)&o, (unsigned long long *)&t) != 3) die("bad history index line");
     if (sh != last) { if (last != UINT64_MAX && sh != last + 1) die("history index shards not consecutive"); (*shards)++; last = sh; }
   }
   fclose(f);
+  if (nrec != *shards) die("history index lacks a #shard line for every shard");
 }
 static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const char *mapoldp, const char *relp, const char *outdir, uint64_t shard_kb, const char *on_shard) {
   if (ri < 0 || ri > 254) die("release index must be 0..254");
-  uint64_t nmo = 0, want_shards = 0; uint32_t *mo = NULL; int prev_release = -1;
+  uint64_t nmo = 0, want_shards = 0, *want_recs = NULL; uint32_t *mo = NULL; int prev_release = -1;
   HistIn h = {0};
   if (!strcmp(prevcmd, "-") != !strcmp(previdx, "-")) die("give both the history command and its index, or neither");
-  if (strcmp(previdx, "-")) read_idx_head(previdx, &prev_release, &want_shards);
+  if (strcmp(previdx, "-")) { read_idx_head(previdx, &prev_release, &want_shards, &want_recs); h.want = want_recs; h.nwant = want_shards; }
   if (ri != prev_release + 1) { fprintf(stderr, "lg: release %d is not the one after %d\n", ri, prev_release); exit(3); }
   if (strcmp(prevcmd, "-")) { mo = load_u32(mapoldp, &nmo); h.f = popen(prevcmd, "r"); if (!h.f) die("cannot run the history command"); }
   FILE *rf = xopen(relp, "rb");
@@ -290,6 +302,7 @@ static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const cha
   if (h.f && getc(h.f) != EOF) die("previous history has data after its last shard");
   if (h.f && pclose(h.f)) die("history command failed");
   hist_close(&w);
+  for (uint64_t k = 0; k < w.shard; k++) fprintf(w.idx, "#shard\t%llu\t%llu\t%llu\n", (unsigned long long)k, (unsigned long long)w.srec[k], (unsigned long long)w.sbytes[k]);
   fclose(rf); if (fclose(w.idx)) die("close failed");
   printf("{\"release_index\": %d, \"targets\": %llu, \"links\": %llu, \"new\": %llu, \"seen_again\": %llu, \"not_seen_this_release\": %llu, \"shards\": %llu, \"bytes\": %llu}\n",
          ri, (unsigned long long)targets, (unsigned long long)links, (unsigned long long)fresh, (unsigned long long)again,
@@ -319,7 +332,7 @@ static int cmd_dump(const char *dir, const char *namesp) {
     if (sscanf(ln, "%llu\t%llu\t%llu", (unsigned long long *)&sh, (unsigned long long *)&offv, (unsigned long long *)&ft) != 3) die("bad history index line");
     if (sh == lastsh) continue; lastsh = sh;
     char p[4096]; snprintf(p, sizeof p, "%s/h-%05llu.bin", dir, (unsigned long long)sh);
-    HistIn h = { xopen(p, "rb"), 0, 0 };
+    HistIn h = { .f = xopen(p, "rb") };
     while (hist_next(&h, &r)) for (uint64_t k = 0; k < r.n; k++) {
       if (r.tgt >= nm.n || r.src[k] >= nm.n) die("id outside the names list");
       printf("%s\t%s\t%u\t%u\n", nm.s[r.tgt], nm.s[r.src[k]], r.first[k], r.last[k]);

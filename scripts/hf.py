@@ -109,6 +109,8 @@ def fetch(remote, sink):
     if m is None:
         return 404
     size, oid = m
+    if not oid or size is None:
+        sys.exit(f"hf.py: {remote} has no large-file hash on record; refusing to accept it unverified")
     st, r = req("GET", resolve_url(remote), stream=True, timeout=600)
     if st != 200:
         sys.exit(f"hf.py: get {remote} failed {st}")

@@ -170,6 +170,32 @@ def body():
     alt2 = f"{W}/alt2.sh"; open(alt2, "w").write(f"#!/bin/sh\nif [ -e {W}/alt2f ]; then cat {W}/p4.txt; else touch {W}/alt2f; cat {W}/p3.txt; fi\n"); os.chmod(alt2, 0o755)
     r = run("inbound", "17", "2", ident, f"{W}/c.bin", alt2, ok=False)
     check("second pass out of order refused", r.returncode != 0)
+    # review round 2 follow-ups
+    open(f"{W}/p5.txt", "w").write("0\t1\n"); open(f"{W}/p6.txt", "w").write("18446744073709551616\t1\n")
+    alt3 = f"{W}/alt3.sh"; open(alt3, "w").write(f"#!/bin/sh\nif [ -e {W}/alt3f ]; then cat {W}/p6.txt; else touch {W}/alt3f; cat {W}/p5.txt; fi\n"); os.chmod(alt3, 0o755)
+    r = run("inbound", "17", "1", ident, f"{W}/c.bin", alt3, ok=False)
+    check("overflowing id in pass 2 refused", r.returncode != 0)
+    import struct
+    sh0 = sorted(x for x in os.listdir(r2) if x.startswith("h-"))[0]
+    os.makedirs(f"{W}/forged/src"); [shutil.copy(f"{r2}/{x}", f"{W}/forged/src/{x}") for x in os.listdir(r2)]
+    shl = sorted(x for x in os.listdir(r2) if x.startswith("h-"))[-1]
+    data = open(f"{W}/forged/src/{shl}", "rb").read(); n = struct.unpack("<Q", data[4:12])[0]; pos = 12
+    def varint(p):
+        v = sh = 0
+        while True:
+            c = data[p]; p += 1; v |= (c & 127) << sh; sh += 7
+            if c < 128: return v, p
+    for _ in range(n - 1):                              # walk to the start of the last record
+        _, pos = varint(pos); cnt, pos = varint(pos)
+        for _ in range(cnt):
+            _, pos = varint(pos); pos += 2
+    forged = data[:4] + struct.pack("<Q", n - 1) + data[12:pos]   # drop the last record, lower the count to match
+    open(f"{W}/forged/src/{shl}", "wb").write(forged)
+    os.makedirs(f"{W}/forged/out")
+    r = run("merge", "3", f"cat {W}/forged/src/h-*.bin", f"{W}/forged/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/forged/out", "2", ok=False)
+    check("shard count rewritten without the index refused", r.returncode != 0, r.stderr.strip()[:80])
+    idx_lines = open(f"{r2}/history.idx").read().splitlines()
+    check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"
     open(unsorted_edges, "w").write("".join(f"{a}\t{b}\n" for a, b in reversed(edges)))
     r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{W}/x.bin", f"cat {unsorted_edges}", ok=False)

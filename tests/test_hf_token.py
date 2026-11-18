@@ -58,6 +58,18 @@ def test_download_must_match_size_and_hash():
         assert accepted == ok, (served, accepted)
 
 
+def test_download_without_hash_refused():
+    hf = load(); body = b"good"
+    hf.meta = lambda remote: (len(body), None)
+    hf.req = lambda method, url, stream=False, timeout=0: (200, Reply(b"evil"))
+    try:
+        hf.fetch("domains.txt", lambda c: None)
+        accepted = True
+    except SystemExit:
+        accepted = False
+    assert not accepted
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0
