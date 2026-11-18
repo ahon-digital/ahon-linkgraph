@@ -81,6 +81,7 @@ static int bget(FILE *f) { int c = getc(f); if (c == EOF) die("truncated record"
 static ssize_t gline(char **s, size_t *cap, FILE *f) {
   ssize_t n = getline(s, cap, f);
   if (n > 0 && memchr(*s, 0, (size_t)n)) die("NUL byte in a text line");
+  if (n > 0 && memchr(*s, '\r', (size_t)n)) die("carriage return in a text line");   // every reader, one rule
   return n;
 }
 static uint64_t mix64(uint64_t z) {   // splitmix64 finaliser
@@ -121,8 +122,11 @@ static int cmd_names(const char *out) {
     char *t1 = strchr(line, '\t'); if (!t1) die("vertex line without a tab");
     *t1 = 0; uint64_t id = num(line, UINT32_MAX, "vertex id");
     if (id != want) { fprintf(stderr, "lg: vertex id %llu where %llu expected\n", (unsigned long long)id, (unsigned long long)want); exit(3); }
-    char *name = t1 + 1; size_t nl = strcspn(name, "\t\n"); name[nl] = 0;
-    if (memchr(name, '\r', nl)) die("carriage return in a vertex name");
+    char *name = t1 + 1; size_t nl = strcspn(name, "\t\n");
+    // what follows the name must be nothing, or one tab and digits (Common Crawl's host count), then the newline
+    { char *rest = name + nl; if (*rest == '\t') { rest++; if (*rest < '0' || *rest > '9') die("bad vertex line"); while (*rest >= '0' && *rest <= '9') rest++; }
+      if (*rest == '\n') rest++; if (*rest) die("bad vertex line"); }
+    name[nl] = 0;
     if (!nl) die("empty vertex name");
     if (prev && strcmp(prev, name) >= 0) { fprintf(stderr, "lg: names not strictly increasing at id %llu\n", (unsigned long long)id); exit(3); }
     if (nl + 1 > pcap) { pcap = nl + 64; prev = xrealloc(prev, pcap); }
@@ -292,6 +296,7 @@ static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_
   if (gline(&line, &lcap, f) <= 0 || strncmp(line, "#release\t", 9)) die("history index has no #release line");
   { size_t L = strlen(line); if (L && line[L - 1] == '\n') line[L - 1] = 0; }   /* only the newline: a \r or anything else fails num() */ *release = (int)num(line + 9, 254, "the index's release");
   const uint64_t BIG = 1ULL << 48;
+  uint64_t *bs = NULL, *bo = NULL, *bt = NULL, nb = 0, bcap = 0;   // every block line, checked against the rest at the end
   while (gline(&line, &lcap, f) > 0) {
     if (!strncmp(line, "#shard\t", 7)) {
       if (fields(line + 7, v, 3, BIG, "an index #shard field") != 3 || v[0] != nrec) die("bad #shard line in the history index");
@@ -301,10 +306,20 @@ static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_
     }
     if (fields(line, v, 3, BIG, "an index field") != 3) die("bad history index line");
     sh = v[0];
-    if (sh != last) { if (last != UINT64_MAX && sh != last + 1) die("history index shards not consecutive"); (*shards)++; last = sh; }
+    if (sh != last) { if ((last == UINT64_MAX && sh != 0) || (last != UINT64_MAX && sh != last + 1)) die("history index shards not consecutive from 0"); (*shards)++; last = sh; }
+    if (nb == bcap) { bcap = bcap ? bcap * 2 : 1024; bs = xrealloc(bs, bcap * 8); bo = xrealloc(bo, bcap * 8); bt = xrealloc(bt, bcap * 8); }
+    bs[nb] = v[0]; bo[nb] = v[1]; bt[nb] = v[2]; nb++;
   }
   fclose(f);
   if (nrec != *shards) die("history index lacks a #shard line for every shard");
+  for (uint64_t i = 0; i < nb; i++) {   // the block lines must agree with each other and with the #shard lines
+    int first_of_shard = (i == 0 || bs[i] != bs[i - 1]);
+    if (first_of_shard && bo[i] != 12) die("history index: a shard's first block is not at its start");
+    if (!first_of_shard && bo[i] <= bo[i - 1]) die("history index: block offsets not increasing");
+    if (bo[i] >= (*bytes)[bs[i]]) die("history index: block offset past its shard's size");
+    if (i > 0 && bt[i] <= bt[i - 1]) die("history index: first targets not increasing");
+  }
+  free(bs); free(bo); free(bt);
 }
 static int cmd_merge(int ri, const char *prevcmd, const char *previdx, const char *mapoldp, const char *relp, const char *outdir, uint64_t shard_kb, const char *on_shard) {
   if (ri < 0 || ri > 254) die("release index must be 0..254");

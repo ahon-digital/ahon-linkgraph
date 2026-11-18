@@ -17,6 +17,13 @@ def load():
     return m
 
 
+def drain(r):
+    """Read a request body the way a real transport would (a streamed body is read to its end)."""
+    if hasattr(r.data, "read"):
+        while r.data.read(8192):
+            pass
+
+
 class Reply:
     def __init__(self, body=b"{}", status=200):
         self.status, self._b = status, io.BytesIO(body)
@@ -103,7 +110,7 @@ def test_upload_reply_headers_cannot_carry_token_off_host():
         status = 200
         def __enter__(self): return self
         def __exit__(self, *a): return False
-    hf.OPENER.open = lambda r, timeout=0: (sent.append((r.full_url, dict(r.header_items()))), Ok())[1]
+    hf.OPENER.open = lambda r, timeout=0: (drain(r), sent.append((r.full_url, dict(r.header_items()))), Ok())[2]
     import tempfile
     f = tempfile.NamedTemporaryFile(delete=False); f.write(b"data"); f.close()
     hf.put(f.name, "x.bin", f.name + ".manifest")
@@ -119,7 +126,7 @@ def test_token_in_any_reply_header_stays_on_huggingface():
         status = 200
         def __enter__(self): return self
         def __exit__(self, *a): return False
-    hf.OPENER.open = lambda r, timeout=0: (sent.append(dict(r.header_items())), Ok())[1]
+    hf.OPENER.open = lambda r, timeout=0: (drain(r), sent.append(dict(r.header_items())), Ok())[2]
     import tempfile
     f = tempfile.NamedTemporaryFile(delete=False); f.write(b"data"); f.close()
     hf.put(f.name, "x.bin", f.name + ".manifest")
@@ -180,7 +187,9 @@ def test_upload_of_a_file_holding_the_token_refused():
     f = tempfile.NamedTemporaryFile(delete=False)
     f.write(b"a" * ((1 << 22) - 5) + hf.TOKEN.encode() + b"tail"); f.close()   # the token straddles the 4 MB read
     try:
-        hf.sha256_size(f.name); refused = False
+        with open(f.name, "rb") as fh:
+            hf.sha256_size(fh)
+        refused = False
     except SystemExit:
         refused = True
     assert refused
@@ -195,8 +204,8 @@ def test_unscanned_stream_refused_off_host():
     except SystemExit:
         refused = True
     assert refused
-    r.lg_scanned = True
-    b._check(r)
+    g = urllib.request.Request("https://storage.example/o", data=hf._StreamGuard(f), method="PUT")
+    b._check(g)                                   # the guarded stream is the one allowed form
 
 
 def test_token_split_across_writes_redacted():
@@ -215,6 +224,38 @@ def test_history_bytes_pass_unchanged():
     got = []
     hf.fetch("history/h-00000.bin", got.append)
     assert b"".join(got) == body
+
+
+def test_only_https_ever_leaves():
+    hf = load(); b = hf._Boundary()
+    for url in ("ftp://user:" + hf.TOKEN + "@storage.example/o", "http://huggingface.co/x", "file:///etc/passwd"):
+        try:
+            b._check(urllib.request.Request(url)); refused = False
+        except SystemExit:
+            refused = True
+        assert refused, url
+    names = {type(h).__name__ for h in hf.OPENER.handlers}
+    assert not names & {"FTPHandler", "FileHandler", "DataHandler", "HTTPHandler", "ProxyHandler"}, names
+
+
+def test_file_overwritten_during_upload_refused():
+    hf = load(); import json as _j, tempfile
+    f = tempfile.NamedTemporaryFile(delete=False); f.write(b"clean-data-0123"); f.close()
+    def negotiate(method, url, data=None, headers=None, stream=False, timeout=0, tries=4):
+        with open(f.name, "r+b") as w:          # someone rewrites the file in place while we negotiate
+            w.write(b"other-data-9876")
+        return 200, _j.dumps({"objects": [{"actions": {"upload": {"href": "https://storage.example/o", "header": {}}}}]}).encode()
+    hf.req = negotiate
+    class Ok:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    hf.OPENER.open = lambda r, timeout=0: (drain(r), Ok())[1]
+    try:
+        hf.put(f.name, "x.bin", f.name + ".m"); refused = False
+    except SystemExit:
+        refused = True
+    assert refused and not os.path.exists(f.name + ".m")
 
 
 def _guard_output(fn):

@@ -258,6 +258,23 @@ def body():
     check("checkidx names the release", good == "2", good)
     open(f"{W}/junkidx", "w").write(open(f"{r2}/history.idx").read() + "NOT AN INDEX\n")
     check("checkidx refuses a junk line", run("checkidx", f"{W}/junkidx", ok=False).returncode != 0)
+    # review round 8: one rule for carriage returns in every reader; strict vertex lines; consistent index
+    open(f"{W}/cr1.txt", "w").write("com.a\rjunk\n"); open(f"{W}/cr2.txt", "w").write("com.b\n")
+    r = run("dictmerge", f"{W}/cr1.txt", f"{W}/cr2.txt", f"{W}/crout.txt", f"{W}/m1", f"{W}/m2", ok=False)
+    check("carriage return in dictmerge input refused", r.returncode != 0)
+    for bad_v in ("0\tcom.a\t1x\n", "0\tcom.a\t1\textra\n", "0\tcom.a\t\n", "0\tcom.a\t1\r\n"):
+        r = run("names", f"{W}/bv.txt", ok=False, stdin=bad_v)
+        check(f"vertex line {bad_v!r} refused", r.returncode != 0)
+    good_v = run("names", f"{W}/gv.txt", ok=False, stdin="0\tcom.a\t1\n1\tcom.b\n")
+    check("vertex lines with and without the host count accepted", good_v.returncode == 0, good_v.stderr.strip()[:60])
+    lines = open(f"{r2}/history.idx").read().splitlines()
+    bad = list(lines); i = next(k for k, l in enumerate(bad) if l and not l.startswith("#"))
+    f0 = bad[i].split("\t"); bad[i] = "\t".join([f0[0], "999", f0[2]])        # first block of shard 0 not at byte 12
+    open(f"{W}/badrel.idx", "w").write("\n".join(bad) + "\n")
+    check("index block not at its shard's start refused", run("checkidx", f"{W}/badrel.idx", ok=False).returncode != 0)
+    bad = list(lines); bad.insert(i + 1, "\t".join([f0[0], "13", "0"]))       # a target going backwards
+    open(f"{W}/badrel2.idx", "w").write("\n".join(bad) + "\n")
+    check("index first targets going backwards refused", run("checkidx", f"{W}/badrel2.idx", ok=False).returncode != 0)
     idx_lines = open(f"{r2}/history.idx").read().splitlines()
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"

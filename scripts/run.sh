@@ -39,7 +39,7 @@ if [ "$n_done" -gt 0 ]; then
   # checked on every run, before "nothing to do", without downloading the big files: the whole index parses and
   # names the last logged release, and the domain list's recorded hash and size are the ones the log wrote
   [ "$("$LG" checkidx prev.idx)" = "$((n_done - 1))" ] || { echo "history index and release log disagree: stop"; exit 1; }
-  [ "$(python3 "$here/hf.py" domsha)" = "$(tail -1 done.tsv | cut -f6,8)" ] || { echo "domains.txt is not the list the last release recorded: stop"; exit 1; }
+  [ "$(python3 "$here/hf.py" domsha)" = "$(tail -1 done.tsv | cut -f6,7)" ] || { echo "domains.txt is not the list the last release recorded: stop"; exit 1; }
 fi
 # the history must be a prefix of Common Crawl's order; anything else stops the build instead of guessing
 cut -f2 done.tsv > done_names.txt
@@ -64,8 +64,8 @@ sha() { python3 -c 'import hashlib,sys; h=hashlib.sha256(); f=open(sys.argv[1],"
 if [ "$RI" = 0 ]; then OLD=-; else
   python3 "$here/hf.py" get domains.txt old_domains.txt
   # the domain list must be the very one the last release wrote: its hash and line count are in the release log
-  want=$(tail -1 done.tsv | cut -f6,7,8)
-  got="$(sha old_domains.txt)	$(wc -l < old_domains.txt | tr -d ' ')	$(wc -c < old_domains.txt | tr -d ' ')"
+  want=$(tail -1 done.tsv | cut -f6,7)
+  got="$(sha old_domains.txt)	$(wc -c < old_domains.txt | tr -d ' ')"
   [ "$want" = "$got" ] || { echo "domains.txt is not the list the last release recorded: stop"; exit 1; }
   OLD=old_domains.txt
 fi
@@ -91,7 +91,7 @@ rm -f map_old.u32 rel.bin
 if [ "${LG_DRY:-0}" = 1 ]; then log "dry run: built $(ls hist | wc -l) files, uploaded nothing"; du -sh hist; exit 0; fi
 log "publish"
 cp done.tsv releases.tsv
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RI" "$R" "$N" "$E" "$(date -u +%FT%TZ)" "$(sha domains.txt)" "$(wc -l < domains.txt | tr -d ' ')" "$(wc -c < domains.txt | tr -d ' ')" >> releases.tsv
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RI" "$R" "$N" "$E" "$(date -u +%FT%TZ)" "$(sha domains.txt)" "$(wc -c < domains.txt | tr -d ' ')" >> releases.tsv
 python3 "$here/hf.py" put hist/history.idx history/history.idx manifest.tsv
 python3 "$here/hf.py" put domains.txt domains.txt manifest.tsv
 python3 "$here/hf.py" put domains.txt.idx domains.txt.idx manifest.tsv

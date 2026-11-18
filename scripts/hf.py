@@ -53,13 +53,15 @@ class _Boundary(urllib.request.BaseHandler):
     handler_order = 1000   # after every other pre-processor, so it sees the request exactly as it will be sent
 
     def _check(self, req):
+        if urllib.parse.urlsplit(req.full_url).scheme != "https":
+            raise SystemExit("hf.py: refused a non-https request")
         if TOKEN and not _hf(req.full_url):
             parts = [req.full_url] + [f"{k}: {v}" for k, v in req.header_items()]
             if isinstance(req.data, (bytes, bytearray)):
                 parts.append(req.data.decode("latin-1"))
-            elif req.data is not None and not getattr(req, "lg_scanned", False):
-                # a streamed body we cannot read here goes off-host only if put() scanned the file first
-                raise SystemExit("hf.py: refused an unscanned streamed body off huggingface.co")
+            elif req.data is not None and not isinstance(req.data, _StreamGuard):
+                # a streamed body we cannot read here goes off-host only through the guard that checks every chunk
+                raise SystemExit("hf.py: refused an unguarded streamed body off huggingface.co")
             if any(TOKEN in p for p in parts):
                 raise SystemExit("hf.py: refused a request off huggingface.co that would have carried the token")
         return req
@@ -67,7 +69,31 @@ class _Boundary(urllib.request.BaseHandler):
     http_request = https_request = _check
 
 
-OPENER = urllib.request.build_opener(_Redirect, _Boundary)
+class _StreamGuard:
+    """The only streamed upload body hf.py sends. Reads from one already-open file, refuses a chunk that would
+    complete the token before handing it over, and hashes what it hands over so the sender can prove the bytes
+    sent are the bytes negotiated."""
+    def __init__(self, f):
+        self._f, self._t, self._tail, self.sha = f, TOKEN.encode(), b"", hashlib.sha256()
+    def read(self, n=-1):
+        c = self._f.read(n)
+        if self._t and self._t in self._tail + c:
+            raise SystemExit("hf.py: refusing to upload a file that contains the token")
+        self._tail = (self._tail + c)[-(len(self._t) - 1):] if self._t else b""
+        self.sha.update(c)
+        return c
+
+
+def _opener():
+    """HTTPS only: no FTP, file, data or plain-http handlers exist in it, and the boundary refuses any other scheme."""
+    o = urllib.request.OpenerDirector()
+    for h in (urllib.request.UnknownHandler(), urllib.request.HTTPSHandler(), _Redirect(),
+              urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor(), _Boundary()):
+        o.add_handler(h)
+    return o
+
+
+OPENER = _opener()
 
 
 def safe_headers(url, extra):
@@ -195,11 +221,13 @@ def cat(remotes):
     return 0
 
 
-def sha256_size(path):
-    """Hash and size of a file to upload, in one pass that also refuses a file containing the token (checked across
-    chunk boundaries). Our uploads are built from public Common Crawl data and never should hold it."""
+def sha256_size(f):
+    """Hash and size of an open file to upload, in one pass that also refuses a file containing the token (checked
+    across chunk boundaries). Our uploads are built from public Common Crawl data and never should hold it. Leaves
+    the file rewound."""
     h, n, t, tail = hashlib.sha256(), 0, TOKEN.encode(), b""
-    with open(path, "rb") as f:
+    f.seek(0)
+    if True:
         while True:
             c = f.read(1 << 22)
             if not c:
@@ -209,11 +237,17 @@ def sha256_size(path):
             tail = (tail + c)[-(len(t) - 1):] if t else b""
             h.update(c)
             n += len(c)
+    f.seek(0)
     return h.hexdigest(), n
 
 
 def put(local, remote, manifest):
-    oid, size = sha256_size(local)
+    with open(local, "rb") as fh:     # one handle for the scan, the hash and the upload; the path is never reopened
+        return _put(fh, remote, manifest)
+
+
+def _put(fh, remote, manifest):
+    oid, size = sha256_size(fh)
     lfs = {"Accept": "application/vnd.git-lfs+json", "Content-Type": "application/vnd.git-lfs+json"}
     st, b = req("POST", f"{H}/datasets/{REPO}.git/info/lfs/objects/batch",
                 json.dumps({"operation": "upload", "transfers": ["basic", "multipart"], "hash_algo": "sha256",
@@ -230,10 +264,16 @@ def put(local, remote, manifest):
             cs = int(hdr["chunk_size"])
             parts = sorted(k for k in hdr if k.isdigit())
             etags = []
-            with open(local, "rb") as f:
+            sent, t, tail = hashlib.sha256(), TOKEN.encode(), b""
+            if True:
+                f = fh
                 for i, k in enumerate(parts):
                     f.seek(i * cs)
                     chunk = f.read(cs)
+                    if t and t in tail + chunk:      # across part boundaries too
+                        raise SystemExit("hf.py: refusing to upload a file that contains the token")
+                    tail = (tail + chunk)[-(len(t) - 1):] if t else b""
+                    sent.update(chunk)
                     for attempt in range(4):
                         try:
                             pr = urllib.request.Request(hdr[k], data=chunk, headers=safe_headers(hdr[k], {}), method="PUT")
@@ -244,18 +284,22 @@ def put(local, remote, manifest):
                             if attempt == 3:
                                 raise SystemExit(f"hf.py: part {i + 1} of {remote} failed")
                             time.sleep(20 * (attempt + 1))
+            if sent.hexdigest() != oid:
+                sys.exit(f"hf.py: {remote} changed while it was being uploaded; refusing it")
             st, _ = req("POST", up["href"], json.dumps({"oid": oid, "parts": etags}).encode(), lfs)
             if st not in (200, 201):
                 sys.exit(f"hf.py: multipart completion failed {st}")
         else:
-            with open(local, "rb") as f:
-                headers = safe_headers(up["href"], hdr)
-                headers["Content-Length"] = str(size)
-                r = urllib.request.Request(up["href"], data=f, headers=headers, method="PUT")
-                r.lg_scanned = True   # sha256_size() read this file and refused the token before we got here
-                with OPENER.open(r, timeout=3600) as x:
-                    if x.status not in (200, 201):
-                        sys.exit(f"hf.py: upload of {remote} failed {x.status}")
+            fh.seek(0)
+            body = _StreamGuard(fh)
+            headers = safe_headers(up["href"], hdr)
+            headers["Content-Length"] = str(size)
+            r = urllib.request.Request(up["href"], data=body, headers=headers, method="PUT")
+            with OPENER.open(r, timeout=3600) as x:
+                if x.status not in (200, 201):
+                    sys.exit(f"hf.py: upload of {remote} failed {x.status}")
+            if body.sha.hexdigest() != oid:
+                sys.exit(f"hf.py: {remote} changed while it was being uploaded; refusing it")
         if "verify" in act:
             st, _ = req("POST", act["verify"]["href"], json.dumps({"oid": oid, "size": size}).encode(), lfs)
             if st != 200:
