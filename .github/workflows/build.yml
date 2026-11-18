@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    if: vars.LG_OFF != '1'
+    if: vars.LG_OFF != '1' || github.event.inputs.dry == '1'   # a manual dry run is allowed while off; it uploads nothing
     runs-on: ubuntu-latest
     timeout-minutes: 340
     steps:
