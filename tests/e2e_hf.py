@@ -96,11 +96,7 @@ try:
     open(f"{T}/other_domains.txt", "w").write("com.aaaa\ncom.zzzz\n"); man0 = f"{T}/dom.manifest"
     subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "put", f"{T}/other_domains.txt", "domains.txt", man0], env=env, check=True, capture_output=True)
     subprocess.run(["python3", f"{ROOT}/scripts/hf.py", "commit", "e2e: swap the domain list", man0], env=env, check=True, capture_output=True)
-    open(T + "/list.txt", "a").write("cc-main-2022-test\n")                    # give the runner a next release to try
-    R4 = "cc-main-2022-test"; d4 = f"{T}/cc/{R4}/domain"; os.makedirs(d4)
-    with gzip.open(f"{d4}/{R4}-domain-vertices.txt.gz", "wt") as f: f.write("0\tcom.a\t1\n1\tcom.b\t1\n")
-    with gzip.open(f"{d4}/{R4}-domain-edges.txt.gz", "wt") as f: f.write("0\t1\n")
-    open(f"{d4}/{R4}-domain.properties", "w").write("nodes=2\narcs=1\n")
+    # the history is current here (no next release): the check must still run before "nothing to do"
     p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=f"{T}/swapdom"), capture_output=True, text=True)
     if p.returncode == 0 or "not the list the last release recorded" not in p.stdout:
         fails.append(f"swapped domain list not refused (exit {p.returncode}): {p.stdout[-200:]}")

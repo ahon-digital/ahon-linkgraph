@@ -37,6 +37,8 @@ n_done=$(grep -c . done.tsv || true)
 awk -F'\t' -v n="$n_done" '$1 != NR - 1 { bad = 1 } END { exit bad || NR != n }' done.tsv || { echo "release log is not numbered 0..n-1: stop"; exit 1; }
 if [ "$n_done" -gt 0 ]; then
   [ "$(head -1 prev.idx)" = "$(printf '#release\t%d' $((n_done - 1)))" ] || { echo "history index and release log disagree: stop"; exit 1; }
+  # checked on every run, before "nothing to do": the domain list on Hugging Face must be the one the log recorded
+  [ "$(python3 "$here/hf.py" domsha)" = "$(tail -1 done.tsv | cut -f6)" ] || { echo "domains.txt is not the list the last release recorded: stop"; exit 1; }
 fi
 # the history must be a prefix of Common Crawl's order; anything else stops the build instead of guessing
 cut -f2 done.tsv > done_names.txt

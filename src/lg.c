@@ -46,7 +46,7 @@ static uint64_t num(const char *s, uint64_t max, const char *what) {
 }
 // Splits a tab-separated index line into at most n strict numbers; returns how many fields it had.
 static int fields(char *line, uint64_t *out, int n, uint64_t max, const char *what) {
-  line[strcspn(line, "\r\n")] = 0; int k = 0; char *t = line;
+  { size_t L = strlen(line); if (L && line[L - 1] == '\n') line[L - 1] = 0; }   /* only the newline: a \r or anything else fails num() */ int k = 0; char *t = line;
   for (;;) {
     char *tab = strchr(t, '\t'); if (tab) *tab = 0;
     if (k == n) return n + 1;
@@ -114,7 +114,8 @@ static int cmd_names(const char *out) {
     char *t1 = strchr(line, '\t'); if (!t1) die("vertex line without a tab");
     *t1 = 0; uint64_t id = num(line, UINT32_MAX, "vertex id");
     if (id != want) { fprintf(stderr, "lg: vertex id %llu where %llu expected\n", (unsigned long long)id, (unsigned long long)want); exit(3); }
-    char *name = t1 + 1; size_t nl = strcspn(name, "\t\r\n"); name[nl] = 0;
+    char *name = t1 + 1; size_t nl = strcspn(name, "\t\n"); name[nl] = 0;
+    if (memchr(name, '\r', nl)) die("carriage return in a vertex name");
     if (!nl) die("empty vertex name");
     if (prev && strcmp(prev, name) >= 0) { fprintf(stderr, "lg: names not strictly increasing at id %llu\n", (unsigned long long)id); exit(3); }
     if (nl + 1 > pcap) { pcap = nl + 64; prev = xrealloc(prev, pcap); }
@@ -282,7 +283,7 @@ static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_
   FILE *f = xopen(p, "rb"); char line[512]; uint64_t sh, last = UINT64_MAX, nrec = 0, v[3]; *shards = 0;
   *recs = xmalloc(8 * 64); *bytes = xmalloc(8 * 64); uint64_t cap = 64;
   if (!fgets(line, sizeof line, f) || strncmp(line, "#release\t", 9)) die("history index has no #release line");
-  line[strcspn(line, "\r\n")] = 0; *release = (int)num(line + 9, 254, "the index's release");
+  { size_t L = strlen(line); if (L && line[L - 1] == '\n') line[L - 1] = 0; }   /* only the newline: a \r or anything else fails num() */ *release = (int)num(line + 9, 254, "the index's release");
   const uint64_t BIG = 1ULL << 48;
   while (fgets(line, sizeof line, f)) {
     if (!strncmp(line, "#shard\t", 7)) {

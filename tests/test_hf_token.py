@@ -129,16 +129,63 @@ def test_token_in_any_reply_header_stays_on_huggingface():
     assert off is not None and hf.TOKEN not in str(off.header_items()) and off.has_header("Accept")
 
 
+def test_boundary_refuses_token_anywhere_off_host():
+    hf = load(); b = hf._Boundary(); T = hf.TOKEN
+    bad = [urllib.request.Request("https://storage.example/o?echo=" + T),
+           urllib.request.Request("https://storage.example/o", headers={"X" + T: "1"}),
+           urllib.request.Request("https://storage.example/o", headers={"X-A": "v" + T}),
+           urllib.request.Request("https://storage.example/o", data=b"body " + T.encode())]
+    for r in bad:
+        try:
+            b._check(r); refused = False
+        except SystemExit:
+            refused = True
+        assert refused, r.full_url
+    b._check(urllib.request.Request("https://huggingface.co/x", headers={"Authorization": "Bearer " + T}))
+    b._check(urllib.request.Request("https://storage.example/o", headers={"X-A": "clean"}))
+
+
+def test_redirect_chain_stopped_before_off_host_hop():
+    hf = load(); T = hf.TOKEN; sent = []
+    import email.message, urllib.response
+    class Fake(urllib.request.BaseHandler):
+        handler_order = 100   # before urllib's real HTTPS handler: nothing in this test touches the network
+        def https_open(self, req):
+            sent.append(req.full_url)
+            hdrs = email.message.Message()
+            if hf._hf(req.full_url):
+                hdrs["Location"] = "https://storage.example/object?echo=" + T
+                r = urllib.response.addinfourl(io.BytesIO(b""), hdrs, req.full_url, 302); r.msg = "Found"
+                return r
+            r = urllib.response.addinfourl(io.BytesIO(b"ok"), hdrs, req.full_url, 200); r.msg = "OK"
+            return r
+    opener = urllib.request.build_opener(hf._Redirect, hf._Boundary, Fake)
+    hf.OPENER = opener
+    try:
+        hf.req("GET", "https://huggingface.co/datasets/org/name/resolve/main/x", tries=1); refused = False
+    except SystemExit:
+        refused = True
+    assert refused and sent == ["https://huggingface.co/datasets/org/name/resolve/main/x"], sent   # first hop sent, off-host hop never
+    fresh = load()
+    assert any(isinstance(h, fresh._Boundary) for h in fresh.OPENER.handlers)   # the real opener carries the boundary
+
+
+def test_plain_print_is_redacted():
+    code, out, tok = _guard_output(lambda hf: print("echo " + hf.TOKEN, file=sys.stderr))
+    assert tok not in out and "[token]" in out
+
+
 def _guard_output(fn):
     hf = load()
-    import contextlib
-    err = io.StringIO()
-    with contextlib.redirect_stderr(err):
-        try:
-            hf.guarded(lambda: fn(hf))
-            code = 0
-        except SystemExit as e:
-            code = e.code
+    err = io.StringIO(); keep = sys.stdout, sys.stderr
+    sys.stderr = err
+    try:
+        hf.guarded(lambda: fn(hf))
+        code = 0
+    except SystemExit as e:
+        code = e.code
+    finally:
+        sys.stdout, sys.stderr = keep
     return code, err.getvalue(), hf.TOKEN
 
 

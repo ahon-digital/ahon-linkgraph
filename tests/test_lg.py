@@ -238,6 +238,14 @@ def body():
     os.makedirs(f"{W}/ovf")
     r = run("merge", "0", "-", "-", f"{d}/map_old.u32", f"{W}/ovf.bin", f"{W}/ovf", "2", ok=False)
     check("overflowing varint refused", r.returncode != 0)
+    # review round 6: a carriage return is junk, never a line end, in the index and in vertex names
+    os.makedirs(f"{W}/cr/src"); [shutil.copy(f"{r2}/{x}", f"{W}/cr/src/{x}") for x in os.listdir(r2)]
+    lines = open(f"{W}/cr/src/history.idx").read().splitlines(); lines[1] = lines[1] + "\rJUNK"
+    open(f"{W}/cr/src/history.idx", "w").write("\n".join(lines) + "\n"); os.makedirs(f"{W}/cr/out")
+    r = run("merge", "3", f"cat {r2}/h-*.bin", f"{W}/cr/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/cr/out", "2", ok=False)
+    check("carriage-return junk in the index refused", r.returncode != 0)
+    r = run("names", f"{W}/crn.txt", ok=False, stdin="0\tcom.a\rjunk\t1\n")
+    check("carriage return in a vertex name refused", r.returncode != 0)
     idx_lines = open(f"{r2}/history.idx").read().splitlines()
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"

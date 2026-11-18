@@ -43,7 +43,28 @@ class _Redirect(urllib.request.HTTPRedirectHandler):
 
 
 _SECRET_HEADERS = {"authorization", "proxy-authorization", "cookie"}
-OPENER = urllib.request.build_opener(_Redirect)
+
+
+class _Boundary(urllib.request.BaseHandler):
+    """The one place the credential boundary is enforced. Every request urllib sends, first hop or redirect, passes
+    through here: if it is not going to huggingface.co and the token appears anywhere in it (URL, any header name or
+    value, an in-memory body), the request is refused, never sent. Filters elsewhere only strip what we can predict;
+    this refuses what we cannot."""
+    handler_order = 1000   # after every other pre-processor, so it sees the request exactly as it will be sent
+
+    def _check(self, req):
+        if TOKEN and not _hf(req.full_url):
+            parts = [req.full_url] + [f"{k}: {v}" for k, v in req.header_items()]
+            if isinstance(req.data, (bytes, bytearray)):
+                parts.append(req.data.decode("latin-1"))
+            if any(TOKEN in p for p in parts):
+                raise SystemExit("hf.py: refused a request off huggingface.co that would have carried the token")
+        return req
+
+    http_request = https_request = _check
+
+
+OPENER = urllib.request.build_opener(_Redirect, _Boundary)
 
 
 def safe_headers(url, extra):
@@ -278,6 +299,8 @@ def main():
     a = sys.argv[1:]
     if a[:1] == ["ensure"]:
         sys.exit(ensure())
+    if a[:1] == ["domsha"]:
+        sys.exit(dom_sha())
     if a[:1] == ["exists"] and len(a) == 2:
         sys.exit(0 if meta(a[1]) is not None else 3)
     if a[:1] == ["get"] and len(a) == 3:
@@ -293,8 +316,35 @@ def main():
     sys.exit(__doc__)
 
 
+def dom_sha():
+    """The sha256 Hugging Face records for domains.txt (no download); empty when absent."""
+    m = meta("domains.txt")
+    print(m[1] if m else "")
+    return 0
+
+
+class _Redacting:
+    """A stdout/stderr that never writes the token, whatever printed it."""
+    def __init__(self, inner):
+        self._i = inner
+        self.buffer = _RedactingBytes(inner.buffer) if hasattr(inner, "buffer") else None
+    def write(self, s): return self._i.write(redact(s))
+    def flush(self): return self._i.flush()
+    def __getattr__(self, k): return getattr(self._i, k)
+
+
+class _RedactingBytes:
+    """Binary side (cat streams history bytes): the token cannot occur in our shards, but if it ever did it is cut."""
+    def __init__(self, inner): self._i = inner
+    def write(self, b):
+        t = TOKEN.encode()
+        return self._i.write(b.replace(t, b"[token]") if t and t in b else b)
+    def flush(self): return self._i.flush()
+
+
 def guarded(fn):
     """Outermost guard: whatever happens inside, nothing that leaves this process carries the token."""
+    sys.stdout, sys.stderr = _Redacting(sys.stdout), _Redacting(sys.stderr)
     try:
         fn()
     except SystemExit as e:
