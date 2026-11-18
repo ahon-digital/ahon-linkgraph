@@ -1,0 +1,51 @@
+name: build
+# Folds the next Common Crawl release into the link history, one release per run, in date order.
+# Free: standard GitHub-hosted runner on a public repo. Off switch: repository variable LG_OFF=1, or disable this workflow.
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # fallback; during the backfill each successful run starts the next one itself
+  workflow_dispatch:
+    inputs:
+      dry:
+        description: "1 = build everything, upload nothing"
+        default: "0"
+permissions:
+  contents: read
+  actions: write   # only to start the next run while the backfill catches up
+concurrency:
+  group: linkgraph
+  cancel-in-progress: false
+jobs:
+  build:
+    if: vars.LG_OFF != '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+      - name: Build and test
+        run: |
+          gcc -O2 -Wall -Wextra -Werror -o lg src/lg.c
+          python3 tests/test_lg.py ./lg
+          python3 tests/test_hf_token.py
+      - name: Fold the next release
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          LG_REPO: ahon-digital/linkgraph
+          LG_DRY: ${{ github.event.inputs.dry || '0' }}
+          LG_WORK: /mnt/lg-work
+        run: |
+          sudo mkdir -p /mnt/lg-work && sudo chown "$USER" /mnt/lg-work
+          rm -f /mnt/lg-work/did_work
+          /usr/bin/time -v -o /tmp/time.txt bash scripts/run.sh
+          grep -E "Maximum resident|Elapsed" /tmp/time.txt
+          df -h / /mnt | tail -2
+      - name: Start the next release while catching up
+        if: success() && github.event.inputs.dry != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -e /mnt/lg-work/did_work ]; then gh workflow run build.yml --ref main; echo "next run started"; else echo "history current; no next run"; fi

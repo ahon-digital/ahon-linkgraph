@@ -1,0 +1,3 @@
+lg
+*.o
+__pycache__/
