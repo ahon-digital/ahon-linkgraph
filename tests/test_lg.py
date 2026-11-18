@@ -80,6 +80,10 @@ def body():
         if ri % 2 == 1:                       # list the names out of byte order, as Common Crawl's 2018 releases do
             names = list(names); random.shuffle(names)
             edges = sorted({(a, b) for a, b in edges})
+        if ri == 2:                           # one name listed twice, as 2019-may-jun-jul lists no.hordaland
+            names = list(names) + [names[5]]  # the extra id gets links of its own
+            extra = len(names) - 1
+            edges = sorted(set(edges) | {(extra, 1), (2, extra), (extra, 9)} - {(extra, extra)})
         vtx = "".join(f"{i}\t{nm}\t1\n" for i, nm in enumerate(names))
         with open(f"{d}/edges.txt", "w") as f:
             f.write("".join(f"{a}\t{b}\n" for a, b in edges))
@@ -136,8 +140,12 @@ def body():
     # refusals
     r = run("names", f"{W}/ok.txt", f"{W}/ok.u32", stdin="0\tcom.b\t1\n1\tcom.a\t1\n")
     check("names in any order accepted and sorted", open(f"{W}/ok.txt").read() == "com.a\ncom.b\n")
-    r = run("names", f"{W}/bad.txt", f"{W}/bad.u32", ok=False, stdin="0\tcom.b\t1\n1\tcom.a\t1\n2\tcom.b\t1\n")
-    check("duplicate names refused", r.returncode != 0)
+    r = run("names", f"{W}/dup.txt", f"{W}/dup.u32", stdin="0\tcom.b\t1\n1\tcom.a\t1\n2\tcom.b\t1\n")
+    pos = [int.from_bytes(open(f"{W}/dup.u32", "rb").read()[i:i + 4], "little") for i in (0, 4, 8)]
+    check("a name listed twice is one domain", open(f"{W}/dup.txt").read() == "com.a\ncom.b\n" and pos == [1, 0, 1], str(pos))
+    many = "".join(f"{i}\tcom.same\t1\n" for i in range(1102))
+    r = run("names", f"{W}/many.txt", f"{W}/many.u32", ok=False, stdin=many)
+    check("a vertex file of duplicates refused", r.returncode != 0)
     r = run("names", f"{W}/c18.txt", f"{W}/c18.u32", stdin="0\tac.2-yr\t1\n1\tac.2\t1\n")   # the 2018 case
     check("2018 ordering (ac.2-yr before ac.2) accepted", open(f"{W}/c18.txt").read() == "ac.2\nac.2-yr\n")
     r = run("names", f"{W}/bad.txt", f"{W}/bad.u32", ok=False, stdin="0\tcom.a\t1\n2\tcom.b\t1\n")

@@ -3,16 +3,19 @@
 // Our own code, standard C only (no outside libraries). Built for a 16 GB / 14 GB-disk runner: the link file is
 // streamed twice instead of stored, and the history is streamed in and out shard by shard.
 //
-//   lg names OUT ORDER              stdin: Common Crawl vertices "id<TAB>rev_name[<TAB>hosts]" -> OUT, the names in
-//                                   byte order, one a line, and ORDER (u32: the release id at each sorted position).
-//                                   Refuses ids that skip and duplicate names; accepts any input order.
+//   lg names OUT POS                stdin: Common Crawl vertices "id<TAB>rev_name[<TAB>hosts]" -> OUT, the distinct
+//                                   names in byte order, one a line, and POS (u32 per release id: its line in OUT).
+//                                   Accepts any input order. A name listed twice (Common Crawl's 2019-may-jun-jul lists
+//                                   no.hordaland twice) is one domain: both ids get the same position. More than
+//                                   1000 + N/1000 duplicates means a broken file and stops. Refuses ids that skip.
 //   lg dictmerge OLD|- REL NEW MAP_OLD MAP_REL
 //                                   Union of two sorted name lists -> NEW (+ NEW.idx), and u32 maps old->new, rel->new.
-//   lg inbound N E MAP_REL ORDER OUT CMD
+//   lg inbound N E MAP_REL POS OUT CMD
 //                                   Runs CMD twice (it must print the release's "from<TAB>to" edges, sorted by from).
 //                                   Pass 1 counts, pass 2 places: "who links to X" in ~8 bytes a node + 4 a link.
-//                                   MAP_REL maps sorted positions to global ids, ORDER sorted positions to release ids.
-//                                   OUT: records (target, count, sources) in global ids, targets and sources ascending.
+//                                   POS maps release ids to distinct-name positions, MAP_REL positions to global ids.
+//                                   OUT: records (target, count, sources) in global ids, targets and sources ascending;
+//                                   a link repeated because two ids share a name is written once.
 //   lg merge REL_INDEX PREVCMD|- PREVIDX|- MAP_OLD REL OUTDIR SHARD_KB [ON_SHARD]
 //                                   Folds a release (lg inbound OUT) into the history. PREVCMD prints the previous
 //                                   history's shards in order; PREVIDX is that history's index. REL_INDEX must be
@@ -132,7 +135,7 @@ static const char *g_names; static const uint64_t *g_noff;
 static int cmp_name(const void *a, const void *b) {
   return strcmp(g_names + g_noff[*(const uint32_t *)a], g_names + g_noff[*(const uint32_t *)b]);
 }
-static int cmd_names(const char *out, const char *orderp) {
+static int cmd_names(const char *out, const char *posp) {
   char *line = NULL; size_t cap = 0; ssize_t len; uint64_t want = 0;
   size_t bcap = 1 << 24, blen = 0; char *buf = xmalloc(bcap);
   uint64_t ocap = 1 << 20; uint64_t *noff = xmalloc(ocap * 8);
@@ -151,20 +154,23 @@ static int cmd_names(const char *out, const char *orderp) {
     if (want == ocap) { ocap *= 2; noff = xrealloc(noff, ocap * 8); }
     noff[want] = blen; memcpy(buf + blen, name, nl + 1); blen += nl + 1; want++;
   }
-  uint32_t *ord = xmalloc(want * 4);
+  uint32_t *ord = xmalloc((want ? want : 1) * 4);
   for (uint64_t i = 0; i < want; i++) ord[i] = (uint32_t)i;
   g_names = buf; g_noff = noff;
   qsort(ord, want, 4, cmp_name);
+  uint32_t *pos = xmalloc((want ? want : 1) * 4); uint64_t distinct = 0, dups = 0;
   FILE *o = xopen(out, "wb");
   for (uint64_t i = 0; i < want; i++) {
     const char *nm = buf + noff[ord[i]];
-    if (i > 0 && strcmp(buf + noff[ord[i - 1]], nm) == 0) die("duplicate vertex name");
-    fputs(nm, o); fputc('\n', o);
+    if (i > 0 && strcmp(buf + noff[ord[i - 1]], nm) == 0) { dups++; pos[ord[i]] = (uint32_t)(distinct - 1); continue; }
+    fputs(nm, o); fputc('\n', o); pos[ord[i]] = (uint32_t)distinct; distinct++;
   }
   if (fclose(o)) die("close failed");
-  save_u32(orderp, ord, want);
-  free(buf); free(noff); free(ord);
-  printf("{\"names\": %llu}\n", (unsigned long long)want); return 0;
+  if (dups > 1000 + want / 1000) { fprintf(stderr, "lg: %llu duplicate names: a broken vertex file\n", (unsigned long long)dups); exit(3); }
+  save_u32(posp, pos, want);
+  free(buf); free(noff); free(ord); free(pos);
+  printf("{\"names\": %llu, \"distinct\": %llu, \"duplicates_merged\": %llu}\n", (unsigned long long)want, (unsigned long long)distinct, (unsigned long long)dups);
+  return 0;
 }
 
 // ---------- dictmerge ----------
@@ -207,56 +213,57 @@ static int cmd_dictmerge(const char *oldp, const char *relp, const char *newp, c
 
 // ---------- inbound ----------
 static int cmp_u32(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
-static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *orderp, const char *outp, const char *cmd) {
-  uint64_t nm, no; uint32_t *bypos = load_u32(maprelp, &nm), *ord = load_u32(orderp, &no);
-  if (nm != N || no != N) die("release map or order size differs from the node count");
-  uint32_t *map = xmalloc(N * 4); uint8_t *seen = xcalloc(N, 1);
-  for (uint64_t p = 0; p < N; p++) {   // map[release id] = global id; ORDER must be a permutation of 0..N-1
-    if (ord[p] >= N || seen[ord[p]]) die("release order is not a permutation");
-    seen[ord[p]] = 1; map[ord[p]] = bypos[p];
-    if (p > 0 && bypos[p] <= bypos[p - 1]) die("release map not ascending");
-  }
-  free(seen); free(bypos);
-  uint32_t *indeg = xcalloc(N, 4); uint64_t a, b, e1 = 0, prev = 0, h1[2] = {1, 2}, h2[2] = {1, 2};
+static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *posp, const char *outp, const char *cmd) {
+  uint64_t M, np; uint32_t *bypos = load_u32(maprelp, &M), *pos = load_u32(posp, &np);
+  if (np != N) die("release position file size differs from the node count");
+  if (M > N || (N && !M)) die("release map size is impossible for the node count");
+  for (uint64_t p = 1; p < M; p++) if (bypos[p] <= bypos[p - 1]) die("release map not ascending");
+  { uint8_t *used = xcalloc(M ? M : 1, 1);   // POS must land every release id on a position, and use every position
+    for (uint64_t i = 0; i < N; i++) { if (pos[i] >= M) die("release position out of range"); used[pos[i]] = 1; }
+    for (uint64_t p = 0; p < M; p++) if (!used[p]) die("a release position is never used");
+    free(used); }
+  uint32_t *indeg = xcalloc(M ? M : 1, 4); uint64_t a, b, e1 = 0, prev = 0, h1[2] = {1, 2}, h2[2] = {1, 2};
   FILE *p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
   while (edge_line(p, &a, &b)) {
     if (a >= N || b >= N) die("edge id out of range");
     if (a < prev) die("edges are not sorted by source");
-    prev = a; indeg[b]++; e1++; fp_add(h1, a, b);
+    prev = a; indeg[pos[b]]++; e1++; fp_add(h1, a, b);
   }
   if (pclose(p)) die("edge command failed on pass 1");
   if (e1 != E) { fprintf(stderr, "lg: pass 1 read %llu edges, properties say %llu\n", (unsigned long long)e1, (unsigned long long)E); exit(4); }
-  uint64_t *off = xmalloc((N + 1) * 8); off[0] = 0;
-  for (uint64_t i = 0; i < N; i++) off[i + 1] = off[i] + indeg[i];
+  uint64_t *off = xmalloc((M + 1) * 8); off[0] = 0;
+  for (uint64_t i = 0; i < M; i++) off[i + 1] = off[i] + indeg[i];
   free(indeg);
-  uint32_t *src = xmalloc(E * 4); uint64_t e2 = 0; prev = 0;
+  uint32_t *src = xmalloc((E ? E : 1) * 4); uint64_t e2 = 0; prev = 0;
   p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
   while (edge_line(p, &a, &b)) {
     if (a >= N || b >= N) die("edge id out of range");
-    if (e2 >= E) die("pass 2 read more edges than pass 1");
     if (a < prev) die("edges are not sorted by source (pass 2)");
     prev = a;
-    if (off[b] >= E) die("pass 2 differs from pass 1");
-    src[off[b]++] = (uint32_t)a; e2++; fp_add(h2, a, b);
+    uint32_t t = pos[b];
+    if (off[t] >= E) die("pass 2 differs from pass 1");
+    src[off[t]++] = bypos[pos[a]]; e2++; fp_add(h2, a, b);
   }
   if (pclose(p)) die("edge command failed on pass 2");
   if (e2 != E) die("pass 2 read a different number of edges");
   if (h1[0] != h2[0] || h1[1] != h2[1]) die("pass 2 read different edges than pass 1 (fingerprint)");
-  for (uint64_t i = N; i > 0; i--) off[i] = off[i - 1];   // each off[i] now holds the end = old start of i+1
+  for (uint64_t i = M; i > 0; i--) off[i] = off[i - 1];   // each off[i] now holds the end = old start of i+1
   off[0] = 0;
-  if (off[N] != E) die("inbound offsets do not add up");
-  FILE *o = xopen(outp, "wb"); uint64_t bytes = 0, targets = 0;
-  for (uint64_t k = 0; k < E; k++) src[k] = map[src[k]];   // sources to global ids, then each target's list sorted
-  for (uint64_t p = 0; p < N; p++) {                        // targets in global order = sorted-position order
-    uint64_t v = ord[p], s = off[v], t = off[v + 1]; if (s == t) continue;
-    qsort(src + s, t - s, 4, cmp_u32);
-    targets++; vput(o, map[v], &bytes); vput(o, t - s, &bytes);
+  if (off[M] != E) die("inbound offsets do not add up");
+  FILE *o = xopen(outp, "wb"); uint64_t bytes = 0, targets = 0, links = 0, collapsed = 0;
+  for (uint64_t t = 0; t < M; t++) {                        // targets in global order = position order
+    uint64_t s = off[t], e = off[t + 1]; if (s == e) continue;
+    qsort(src + s, e - s, 4, cmp_u32);
+    uint64_t w = s;                                         // a link repeated through a shared name is kept once
+    for (uint64_t k = s; k < e; k++) { if (k > s && src[k] == src[w - 1]) { collapsed++; continue; } src[w++] = src[k]; }
+    targets++; links += w - s; vput(o, bypos[t], &bytes); vput(o, w - s, &bytes);
     uint64_t ps = 0;
-    for (uint64_t k = s; k < t; k++) { uint64_t g = src[k]; if (k > s && g <= ps) die("duplicate edge"); vput(o, g - ps, &bytes); ps = g; }
+    for (uint64_t k = s; k < w; k++) { uint64_t g = src[k]; vput(o, g - ps, &bytes); ps = g; }
   }
   if (fclose(o)) die("close failed");
-  printf("{\"nodes\": %llu, \"edges\": %llu, \"targets\": %llu, \"bytes\": %llu}\n",
-         (unsigned long long)N, (unsigned long long)E, (unsigned long long)targets, (unsigned long long)bytes);
+  if (collapsed > E / 1000 + 1000) { fprintf(stderr, "lg: %llu repeated links: the release repeats edges\n", (unsigned long long)collapsed); exit(3); }
+  printf("{\"nodes\": %llu, \"distinct\": %llu, \"edges\": %llu, \"targets\": %llu, \"links\": %llu, \"repeats_collapsed\": %llu, \"bytes\": %llu}\n",
+         (unsigned long long)N, (unsigned long long)M, (unsigned long long)E, (unsigned long long)targets, (unsigned long long)links, (unsigned long long)collapsed, (unsigned long long)bytes);
   return 0;
 }
 

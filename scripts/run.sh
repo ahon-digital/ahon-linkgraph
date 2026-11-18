@@ -62,7 +62,7 @@ avail=$(awk '/MemAvailable/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo
 if [ "$avail" -gt 0 ] && [ "$need" -gt $(( avail - 1500000000 )) ]; then echo "not enough memory ($((avail / 1000000)) MB available)"; exit 1; fi
 
 log "names"
-curl -sSf --retry 5 --retry-delay 30 "$B-domain-vertices.txt.gz" | gzip -dc | "$LG" names rel_names.txt rel_order.u32
+curl -sSf --retry 5 --retry-delay 30 "$B-domain-vertices.txt.gz" | gzip -dc | "$LG" names rel_names.txt rel_pos.u32
 sha() { python3 -c 'import hashlib,sys; h=hashlib.sha256(); f=open(sys.argv[1],"rb"); [h.update(c) for c in iter(lambda: f.read(1<<22), b"")]; print(h.hexdigest())' "$1"; }
 if [ "$RI" = 0 ]; then OLD=-; else
   python3 "$here/hf.py" get domains.txt old_domains.txt
@@ -76,8 +76,8 @@ fi
 rm -f rel_names.txt old_domains.txt
 
 log "inbound (two streamed passes)"
-"$LG" inbound "$N" "$E" map_rel.u32 rel_order.u32 rel.bin "curl -sSf --retry 5 --retry-delay 30 '$B-domain-edges.txt.gz' | gzip -dc"
-rm -f map_rel.u32 rel_order.u32
+"$LG" inbound "$N" "$E" map_rel.u32 rel_pos.u32 rel.bin "curl -sSf --retry 5 --retry-delay 30 '$B-domain-edges.txt.gz' | gzip -dc"
+rm -f map_rel.u32 rel_pos.u32
 
 log "merge into history"
 # the dataset is created only here: past the "nothing to do" exit and never on a dry run (shards upload during merge)
