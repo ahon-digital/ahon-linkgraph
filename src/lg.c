@@ -101,7 +101,11 @@ static int edge_line(FILE *f, uint64_t *a, uint64_t *b) {
     while (c >= '0' && c <= '9') { if (v > 100000000000ULL) die("number too large in the edge stream"); v = v * 10 + (uint64_t)(c - '0'); digits++; c = getc_unlocked(f); }
     if (!digits) die("malformed edge line");
     if (k == 0) { if (c != '\t') die("malformed edge line"); *a = v; c = getc_unlocked(f); }
-    else { if (c != '\n' && c != EOF) die("malformed edge line"); *b = v; }
+    else {
+      if (c != '\n' && c != EOF) die("malformed edge line");
+      if (c == EOF && ferror(f)) die("read error in the edge stream");   // an error is never the line's end
+      *b = v;
+    }
   }
   return 1;
 }
@@ -110,7 +114,8 @@ static uint32_t *load_u32(const char *path, uint64_t *n) {
   FILE *f = xopen(path, "rb"); fseeko(f, 0, SEEK_END); off_t sz = ftello(f); fseeko(f, 0, SEEK_SET);
   if (sz % 4) die("map file size is not a multiple of 4");
   *n = (uint64_t)sz / 4; uint32_t *a = xmalloc((size_t)sz);
-  if (*n && fread(a, 4, *n, f) != *n) die("short read on map"); fclose(f); return a;
+  if (*n && fread(a, 4, *n, f) != *n) die("short read on map");
+  fclose(f); return a;
 }
 static void save_u32(const char *path, const uint32_t *a, uint64_t n) {
   FILE *f = xopen(path, "wb"); if (n && fwrite(a, 4, n, f) != n) die("short write on map"); if (fclose(f)) die("close failed");
@@ -126,7 +131,8 @@ static int cmd_names(const char *out) {
     char *name = t1 + 1; size_t nl = strcspn(name, "\t\n");
     // what follows the name must be nothing, or one tab and digits (Common Crawl's host count), then the newline
     { char *rest = name + nl; if (*rest == '\t') { rest++; if (*rest < '0' || *rest > '9') die("bad vertex line"); while (*rest >= '0' && *rest <= '9') rest++; }
-      if (*rest == '\n') rest++; if (*rest) die("bad vertex line"); }
+      if (*rest == '\n') rest++;
+      if (*rest) die("bad vertex line"); }
     name[nl] = 0;
     if (!nl) die("empty vertex name");
     if (prev && strcmp(prev, name) >= 0) { fprintf(stderr, "lg: names not strictly increasing at id %llu\n", (unsigned long long)id); exit(3); }
@@ -271,7 +277,8 @@ typedef struct { const char *dir, *on_shard; uint64_t limit, bytes, recs, block_
 static void hist_close(HistOut *w) {
   if (!w->f) return;
   fseeko(w->f, w->hdr + 4, SEEK_SET); fwrite(&w->recs, 8, 1, w->f);
-  if (fclose(w->f)) die("close failed"); w->f = NULL;
+  if (fclose(w->f)) die("close failed");
+  w->f = NULL;
   if (w->shard >= w->scap) { w->scap = w->scap ? w->scap * 2 : 64; w->srec = xrealloc(w->srec, w->scap * 8); w->sbytes = xrealloc(w->sbytes, w->scap * 8); }
   w->srec[w->shard] = w->recs; w->sbytes[w->shard] = w->bytes; w->shard++;
   if (w->on_shard) {
@@ -418,7 +425,8 @@ static int cmd_dump(const char *dir, const char *namesp) {
   while ((lnl = gline(&ln, &lncap, ix)) > 0) {
     if (ln[0] == '#') continue;
     { uint64_t v[3]; if (fields(ln, v, 3, 1ULL << 48, "an index field") != 3) die("bad history index line"); sh = v[0]; offv = v[1]; ft = v[2]; }
-    if (sh == lastsh) continue; lastsh = sh;
+    if (sh == lastsh) continue;
+    lastsh = sh;
     char p[4096]; snprintf(p, sizeof p, "%s/h-%05llu.bin", dir, (unsigned long long)sh);
     HistIn h = { .f = xopen(p, "rb") };
     while (hist_next(&h, &r)) for (uint64_t k = 0; k < r.n; k++) {
@@ -445,7 +453,8 @@ static int cmd_lookup(const char *dir, const char *namesp, const char *domain) {
   while ((lnl = gline(&ln, &lncap, ix)) > 0) {
     if (ln[0] == '#') continue;
     { uint64_t v[3]; if (fields(ln, v, 3, 1ULL << 48, "an index field") != 3) die("bad history index line"); sh = v[0]; offv = v[1]; ft = v[2]; }
-    if (ft > id) break; bsh = sh; boff = offv;
+    if (ft > id) break;
+    bsh = sh; boff = offv;
   }
   fclose(ix);
   if (bsh == UINT64_MAX) { printf("{\"domain\": \"%s\", \"known\": true, \"linking_domains\": 0}\n", domain); return 0; }
