@@ -65,7 +65,7 @@ static int vget(FILE *f, uint64_t *x) {   // 1 ok, 0 clean end before the first 
   uint64_t v = 0; int sh = 0, c;
   for (;;) {
     c = getc(f);
-    if (c == EOF) { if (sh == 0) return 0; die("truncated varint"); }
+    if (c == EOF) { if (ferror(f)) die("read error"); if (sh == 0) return 0; die("truncated varint"); }
     if (sh == 63 && c > 1) die("varint overflow");
     v |= (uint64_t)(c & 127) << sh;
     if (c < 128) break;
@@ -80,6 +80,7 @@ static int bget(FILE *f) { int c = getc(f); if (c == EOF) die("truncated record"
 // silently drop the rest). Returns the length including any newline; -1 at end.
 static ssize_t gline(char **s, size_t *cap, FILE *f) {
   ssize_t n = getline(s, cap, f);
+  if (n < 0 && ferror(f)) die("read error");
   if (n > 0 && memchr(*s, 0, (size_t)n)) die("NUL byte in a text line");
   if (n > 0 && memchr(*s, '\r', (size_t)n)) die("carriage return in a text line");   // every reader, one rule
   return n;
@@ -94,7 +95,7 @@ static void fp_add(uint64_t h[2], uint64_t a, uint64_t b) { uint64_t e = (a << 3
 // Anything else stops: a sign, a space, an empty field, a third field, or a number past 10^11.
 static int edge_line(FILE *f, uint64_t *a, uint64_t *b) {
   int c = getc_unlocked(f);
-  if (c == EOF) return 0;
+  if (c == EOF) { if (ferror(f)) die("read error in the edge stream"); return 0; }
   for (int k = 0; k < 2; k++) {
     uint64_t v = 0; int digits = 0;
     while (c >= '0' && c <= '9') { if (v > 100000000000ULL) die("number too large in the edge stream"); v = v * 10 + (uint64_t)(c - '0'); digits++; c = getc_unlocked(f); }
@@ -241,6 +242,7 @@ static int hist_next(HistIn *h, Rec *r) {
   if (!h->f) return 0;
   while (h->left == 0) {
     char m[4]; size_t k = fread(m, 1, 4, h->f);
+    if (k < 4 && ferror(h->f)) die("read error in the history");
     hist_shard_done(h);
     if (k == 0) return 0;
     if (k != 4 || memcmp(m, "LGH1", 4)) die("history shard header missing");
@@ -312,6 +314,7 @@ static void read_idx_head(const char *p, int *release, uint64_t *shards, uint64_
       if (fields(line + 7, v, 3, BIG, "an index #shard field") != 3 || v[0] != nrec) die("bad #shard line in the history index");
       uint64_t rc = v[1], by = v[2];
       if (nrec == cap) { cap *= 2; *recs = xrealloc(*recs, cap * 8); *bytes = xrealloc(*bytes, cap * 8); }
+      if (rc == 0 || by <= 12) die("history index: a shard with no records");
       (*recs)[nrec] = rc; (*bytes)[nrec] = by; nrec++; continue;
     }
     if (fields(line, v, 3, BIG, "an index field") != 3) die("bad history index line");

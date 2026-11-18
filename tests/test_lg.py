@@ -291,6 +291,14 @@ def body():
     open(f"{W}/fl/src/{lastsh}", "wb").write(raw); os.makedirs(f"{W}/fl/out")
     r = run("merge", "3", f"cat {W}/fl/src/h-*.bin", f"{W}/fl/src/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/fl/out", "2", ok=False)
     check("a link with first after last refused", r.returncode != 0, r.stderr.strip()[:80])
+    # review round 10 follow-ups: a read error is never end of input; a shard always holds records
+    os.makedirs(f"{W}/adir"); os.makedirs(f"{W}/rd")
+    r = run("merge", "0", "-", "-", f"{d}/map_old.u32", f"{W}/adir", f"{W}/rd", "2", ok=False)
+    check("unreadable release input refused", r.returncode != 0)
+    r = run("dictmerge", f"{W}/adir", f"{W}/r0/names.txt", f"{W}/dm.txt", f"{W}/dm1", f"{W}/dm2", ok=False)
+    check("unreadable old dictionary refused", r.returncode != 0)
+    open(f"{W}/zero.idx", "w").write("#release\t0\n0\t12\t0\n#shard\t0\t0\t17\n")
+    check("index shard with no records refused", run("checkidx", f"{W}/zero.idx", ok=False).returncode != 0)
     idx_lines = open(f"{r2}/history.idx").read().splitlines()
     check("index lists every shard's records", sum(1 for l in idx_lines if l.startswith("#shard")) == n2)
     unsorted_edges = f"{W}/unsorted.txt"

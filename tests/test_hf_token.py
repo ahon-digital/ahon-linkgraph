@@ -266,7 +266,8 @@ def _refused(fn):
 
 
 def test_malformed_listing_is_never_empty():
-    for body in (b'[{"path": "releases.tsv", "type": "fi', b'{"not": "a list"}', b'[{"type": "file"}]', b'[1, 2]'):
+    for body in (b'[{"path": "releases.tsv", "type": "fi', b'{"not": "a list"}', b'[{"type": "file"}]', b'[1, 2]',
+                 b'[{"path": "releases.tsv", "type": "flie", "size": 17}]'):
         hf = load()
         hf.req = lambda method, url, data=None, headers=None, stream=False, timeout=0, tries=4, b=body: (200, b)
         assert _refused(lambda: hf.meta("releases.tsv")), body

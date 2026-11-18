@@ -151,8 +151,8 @@ def file_entries(b):
     """A tree listing: a list of objects, each with a string path and type. Anything else stops."""
     v = jsonbody(b, list)
     for x in v:
-        if not isinstance(x, dict) or not isinstance(x.get("path"), str) or not isinstance(x.get("type"), str):
-            sys.exit("hf.py: a listing entry had an unexpected shape")
+        if not isinstance(x, dict) or not isinstance(x.get("path"), str) or x.get("type") not in ("file", "directory"):
+            sys.exit("hf.py: a listing entry had an unexpected shape")   # an unknown type is never read as absence
     return [x for x in v if x["type"] == "file"]
 
 
