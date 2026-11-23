@@ -12,7 +12,7 @@ quiet when it breaks is the failure it exists to catch, so an unreadable source 
 import argparse, datetime, json, os, subprocess, sys, urllib.request
 
 DATASET = "https://huggingface.co/datasets/ahon-digital/linkgraph/resolve/main/releases.tsv"
-RUNS = "https://api.github.com/repos/ahon-digital/ahon-linkgraph/actions/workflows/build.yml/runs?per_page=10"
+RUNS = "https://api.github.com/repos/ahon-digital/ahon-linkgraph/actions/workflows/build.yml/runs?per_page=100"
 here = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -33,14 +33,21 @@ def main():
         done, last, added = len(rows), rows[-1][1], datetime.datetime.fromisoformat(rows[-1][4].replace("Z", "+00:00"))
     except Exception as e:
         return page(f"link history: cannot read the published release list ({type(e).__name__})")
-    r = subprocess.run([sys.executable, os.path.join(here, "releases.py")], capture_output=True, text=True, timeout=120)
+    try:
+        r = subprocess.run([sys.executable, os.path.join(here, "releases.py")], capture_output=True, text=True, timeout=120)
+    except Exception as e:   # a timeout or a failed launch is a page, not a traceback
+        return page(f"link history: cannot read Common Crawl's release list ({type(e).__name__})")
     if r.returncode:
-        return page(f"link history: cannot read Common Crawl's release list ({r.stderr.strip()[:120]})")
+        last = (r.stderr.strip().splitlines() or ["no output"])[-1]
+        return page(f"link history: cannot read Common Crawl's release list ({last[:160]})")
     total = len(r.stdout.split())
     try:
-        runs = [x for x in json.loads(get(RUNS))["workflow_runs"] if x.get("status") == "completed" and x.get("conclusion") != "cancelled"]
+        listed = json.loads(get(RUNS))["workflow_runs"]
+        runs = [x for x in listed if x.get("status") == "completed" and x.get("conclusion") != "cancelled"]
     except Exception as e:
         return page(f"link history: cannot read the build runs ({type(e).__name__})")
+    if len(runs) < a.failed_runs and len(listed) >= 100:   # the window holds too few finished runs to judge
+        return page(f"link history: the last 100 build runs hold only {len(runs)} finished, non-cancelled ones")
     hours = (now - added).total_seconds() / 3600
     state = f"{done} of {total} releases, last {last} added {hours:.0f} h ago"
     recent = [x["conclusion"] for x in runs[:a.failed_runs]]
@@ -53,7 +60,7 @@ def main():
 
 
 def page(msg):
-    print(msg)
+    print(" ".join(str(msg).split()))   # one line, whatever the source put in it
     return 1
 
 
