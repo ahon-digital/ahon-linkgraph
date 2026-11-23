@@ -56,9 +56,12 @@ log "next: $R (index $RI)"
 B="$CC/$R/domain/$R"
 curl -sSf --retry 5 --retry-delay 30 "$B-domain.properties" -o props.txt
 N=$(sed -n 's/^nodes=//p' props.txt); E=$(sed -n 's/^arcs=//p' props.txt)
-# inbound holds ~16 bytes a node (positions, release map, offsets) plus 4 bytes a link of one part. When all links do
-# not fit, it places them in parts, streaming the edges once more per part (each pass ~15 min on 2025-size releases).
-fixed=$(( 16 * (N + 1) ))
+# inbound peaks at 20 bytes a node while counting (positions, release map, in-degrees and offsets live together),
+# then holds 16 bytes a node plus 4 bytes a link of one part. When all links do not fit, it places them in parts,
+# streaming the edges once more per part (each pass ~15 min on 2025-size releases). A domain with more links than a
+# part gets a part of its own, paid from the 1.5 GB headroom; inbound reports that size. Running out of memory kills
+# the run before anything is published.
+fixed=$(( 20 * (N + 1) ))
 avail=$(awk '/MemAvailable/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "$avail" -gt 0 ]; then room=$(( (avail - 1500000000 - fixed) / 4 )); else room=$E; fi
 [ "$room" -gt 0 ] || { echo "not enough memory for $N nodes ($((avail / 1000000)) MB available)"; exit 1; }

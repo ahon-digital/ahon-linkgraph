@@ -173,6 +173,11 @@ def body():
         os.chmod(late, 0o755)
         r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", late, "97", ok=False)
         check(f"parts: {why} refused", r.returncode != 0, r.stderr.strip()[:80])
+    open(f"{W}/hub.txt", "w").write("".join(f"{i}\t0\n" for i in range(1, 10)))   # review 23 Nov: one domain over a part
+    ident10 = f"{W}/ident10.u32"; open(ident10, "wb").write(b"".join(i.to_bytes(4, "little") for i in range(10)))
+    r = run("inbound", "10", "9", ident10, ident10, f"{W}/hub.bin", f"cat {W}/hub.txt", "5")
+    j = json.loads(r.stdout)
+    check("a domain over a part gets a part of its own, reported", j["part_links"] == 9 and j["max_links_one_domain"] == 9 and j["parts"] == 1 and "more than a part" in r.stderr, r.stdout + r.stderr)
     short = f"{W}/short.sh"; cnt = f"{W}/cntshort"   # a later pass losing its last edge
     open(short, "w").write(f"#!/bin/sh\necho x >> {cnt}\nif [ $(wc -l < {cnt}) -ge 3 ]; then sed '$d' {d}/edges.txt; else cat {d}/edges.txt; fi\n")
     os.chmod(short, 0o755)

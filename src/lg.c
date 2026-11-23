@@ -239,7 +239,11 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
   free(indeg);
   if (off[M] != E) die("inbound offsets do not add up");
   if (part == 0 || part > E) part = E;
-  if (part < maxdeg) part = maxdeg;                         // one target's links are never split
+  if (part < maxdeg) {                                      // one target's links are never split
+    fprintf(stderr, "lg: one domain has %llu links, more than a part of %llu: that part holds %llu\n",
+            (unsigned long long)maxdeg, (unsigned long long)part, (unsigned long long)maxdeg);
+    part = maxdeg;
+  }
   uint32_t *src = xmalloc((part ? part : 1) * 4);
   FILE *o = xopen(outp, "wb"); uint64_t bytes = 0, targets = 0, links = 0, collapsed = 0, parts = 0;
   for (uint64_t t0 = 0; t0 < M;) {                          // parts in target order, so OUT stays in global order
@@ -279,8 +283,8 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
   if (fclose(o)) die("close failed");
   free(src); free(off);
   if (collapsed > E / 1000 + 1000) { fprintf(stderr, "lg: %llu repeated links: the release repeats edges\n", (unsigned long long)collapsed); exit(3); }
-  printf("{\"nodes\": %llu, \"distinct\": %llu, \"edges\": %llu, \"targets\": %llu, \"links\": %llu, \"repeats_collapsed\": %llu, \"bytes\": %llu, \"parts\": %llu}\n",
-         (unsigned long long)N, (unsigned long long)M, (unsigned long long)E, (unsigned long long)targets, (unsigned long long)links, (unsigned long long)collapsed, (unsigned long long)bytes, (unsigned long long)parts);
+  printf("{\"nodes\": %llu, \"distinct\": %llu, \"edges\": %llu, \"targets\": %llu, \"links\": %llu, \"repeats_collapsed\": %llu, \"bytes\": %llu, \"parts\": %llu, \"part_links\": %llu, \"max_links_one_domain\": %llu}\n",
+         (unsigned long long)N, (unsigned long long)M, (unsigned long long)E, (unsigned long long)targets, (unsigned long long)links, (unsigned long long)collapsed, (unsigned long long)bytes, (unsigned long long)parts, (unsigned long long)part, (unsigned long long)maxdeg);
   return 0;
 }
 
