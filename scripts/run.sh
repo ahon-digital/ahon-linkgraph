@@ -56,10 +56,15 @@ log "next: $R (index $RI)"
 B="$CC/$R/domain/$R"
 curl -sSf --retry 5 --retry-delay 30 "$B-domain.properties" -o props.txt
 N=$(sed -n 's/^nodes=//p' props.txt); E=$(sed -n 's/^arcs=//p' props.txt)
-need=$(( 8 * (N + 1) + 4 * E + 8 * N ))
-log "nodes $N links $E, memory needed about $((need / 1000000)) MB"
+# inbound holds ~16 bytes a node (positions, release map, offsets) plus 4 bytes a link of one part. When all links do
+# not fit, it places them in parts, streaming the edges once more per part (each pass ~15 min on 2025-size releases).
+fixed=$(( 16 * (N + 1) ))
 avail=$(awk '/MemAvailable/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0)
-if [ "$avail" -gt 0 ] && [ "$need" -gt $(( avail - 1500000000 )) ]; then echo "not enough memory ($((avail / 1000000)) MB available)"; exit 1; fi
+if [ "$avail" -gt 0 ]; then room=$(( (avail - 1500000000 - fixed) / 4 )); else room=$E; fi
+[ "$room" -gt 0 ] || { echo "not enough memory for $N nodes ($((avail / 1000000)) MB available)"; exit 1; }
+if [ "$room" -ge "$E" ]; then PARTS=1; PART=$E; else PARTS=$(( (E + room - 1) / room )); PART=$(( (E + PARTS - 1) / PARTS )); fi
+[ "$PARTS" -le "${LG_MAX_PARTS:-6}" ] || { echo "would need $PARTS passes over the links ($((avail / 1000000)) MB available): stop"; exit 1; }
+log "nodes $N links $E, memory about $(( (fixed + 4 * PART) / 1000000 )) MB in $PARTS part(s) of $PART links"
 
 log "names"
 curl -sSf --retry 5 --retry-delay 30 "$B-domain-vertices.txt.gz" | gzip -dc | "$LG" names rel_names.txt rel_pos.u32
@@ -75,8 +80,8 @@ fi
 "$LG" dictmerge "$OLD" rel_names.txt domains.txt map_old.u32 map_rel.u32
 rm -f rel_names.txt old_domains.txt
 
-log "inbound (two streamed passes)"
-"$LG" inbound "$N" "$E" map_rel.u32 rel_pos.u32 rel.bin "curl -sSf --retry 5 --retry-delay 30 '$B-domain-edges.txt.gz' | gzip -dc"
+log "inbound ($((PARTS + 1)) streamed passes)"
+"$LG" inbound "$N" "$E" map_rel.u32 rel_pos.u32 rel.bin "curl -sSf --retry 5 --retry-delay 30 '$B-domain-edges.txt.gz' | gzip -dc" "$PART"
 rm -f map_rel.u32 rel_pos.u32
 
 log "merge into history"

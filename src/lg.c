@@ -1,7 +1,7 @@
 // lg - Ahon link graph builder. Turns Common Crawl's domain-level web graphs into one growing link history:
 // for every domain, which domains have linked to it, and the first and last release each link was seen in.
 // Our own code, standard C only (no outside libraries). Built for a 16 GB / 14 GB-disk runner: the link file is
-// streamed twice instead of stored, and the history is streamed in and out shard by shard.
+// streamed (twice, or once per part when memory is short) instead of stored, and the history is streamed in and out shard by shard.
 //
 //   lg names OUT POS                stdin: Common Crawl vertices "id<TAB>rev_name[<TAB>hosts]" -> OUT, the distinct
 //                                   names in byte order, one a line, and POS (u32 per release id: its line in OUT).
@@ -10,9 +10,12 @@
 //                                   1000 + N/1000 duplicates means a broken file and stops. Refuses ids that skip.
 //   lg dictmerge OLD|- REL NEW MAP_OLD MAP_REL
 //                                   Union of two sorted name lists -> NEW (+ NEW.idx), and u32 maps old->new, rel->new.
-//   lg inbound N E MAP_REL POS OUT CMD
-//                                   Runs CMD twice (it must print the release's "from<TAB>to" edges, sorted by from).
-//                                   Pass 1 counts, pass 2 places: "who links to X" in ~8 bytes a node + 4 a link.
+//   lg inbound N E MAP_REL POS OUT CMD [PART_LINKS]
+//                                   Runs CMD (it must print the release's "from<TAB>to" edges, sorted by from) once to
+//                                   count, then once per part to place: "who links to X" in ~16 bytes a node + 4 a
+//                                   link of the part. A part is a run of targets holding at most PART_LINKS links
+//                                   (default E: one part; a target with more links than that is a part of its own).
+//                                   Every placing pass must read the counting pass's edges exactly, or it stops.
 //                                   POS maps release ids to distinct-name positions, MAP_REL positions to global ids.
 //                                   OUT: records (target, count, sources) in global ids, targets and sources ascending;
 //                                   a link repeated because two ids share a name is written once.
@@ -213,7 +216,7 @@ static int cmd_dictmerge(const char *oldp, const char *relp, const char *newp, c
 
 // ---------- inbound ----------
 static int cmp_u32(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
-static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *posp, const char *outp, const char *cmd) {
+static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *posp, const char *outp, const char *cmd, uint64_t part) {
   uint64_t M, np; uint32_t *bypos = load_u32(maprelp, &M), *pos = load_u32(posp, &np);
   if (np != N) die("release position file size differs from the node count");
   if (M > N || (N && !M)) die("release map size is impossible for the node count");
@@ -222,7 +225,7 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
     for (uint64_t i = 0; i < N; i++) { if (pos[i] >= M) die("release position out of range"); used[pos[i]] = 1; }
     for (uint64_t p = 0; p < M; p++) if (!used[p]) die("a release position is never used");
     free(used); }
-  uint32_t *indeg = xcalloc(M ? M : 1, 4); uint64_t a, b, e1 = 0, prev = 0, h1[2] = {1, 2}, h2[2] = {1, 2};
+  uint32_t *indeg = xcalloc(M ? M : 1, 4); uint64_t a, b, e1 = 0, prev = 0, h1[2] = {1, 2};
   FILE *p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
   while (edge_line(p, &a, &b)) {
     if (a >= N || b >= N) die("edge id out of range");
@@ -231,39 +234,53 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
   }
   if (pclose(p)) die("edge command failed on pass 1");
   if (e1 != E) { fprintf(stderr, "lg: pass 1 read %llu edges, properties say %llu\n", (unsigned long long)e1, (unsigned long long)E); exit(4); }
-  uint64_t *off = xmalloc((M + 1) * 8); off[0] = 0;
-  for (uint64_t i = 0; i < M; i++) off[i + 1] = off[i] + indeg[i];
+  uint64_t *off = xmalloc((M + 1) * 8), maxdeg = 0; off[0] = 0;   // off[t]: where target t's links start
+  for (uint64_t i = 0; i < M; i++) { off[i + 1] = off[i] + indeg[i]; if (indeg[i] > maxdeg) maxdeg = indeg[i]; }
   free(indeg);
-  uint32_t *src = xmalloc((E ? E : 1) * 4); uint64_t e2 = 0; prev = 0;
-  p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
-  while (edge_line(p, &a, &b)) {
-    if (a >= N || b >= N) die("edge id out of range");
-    if (a < prev) die("edges are not sorted by source (pass 2)");
-    prev = a;
-    uint32_t t = pos[b];
-    if (off[t] >= E) die("pass 2 differs from pass 1");
-    src[off[t]++] = bypos[pos[a]]; e2++; fp_add(h2, a, b);
-  }
-  if (pclose(p)) die("edge command failed on pass 2");
-  if (e2 != E) die("pass 2 read a different number of edges");
-  if (h1[0] != h2[0] || h1[1] != h2[1]) die("pass 2 read different edges than pass 1 (fingerprint)");
-  for (uint64_t i = M; i > 0; i--) off[i] = off[i - 1];   // each off[i] now holds the end = old start of i+1
-  off[0] = 0;
   if (off[M] != E) die("inbound offsets do not add up");
-  FILE *o = xopen(outp, "wb"); uint64_t bytes = 0, targets = 0, links = 0, collapsed = 0;
-  for (uint64_t t = 0; t < M; t++) {                        // targets in global order = position order
-    uint64_t s = off[t], e = off[t + 1]; if (s == e) continue;
-    qsort(src + s, e - s, 4, cmp_u32);
-    uint64_t w = s;                                         // a link repeated through a shared name is kept once
-    for (uint64_t k = s; k < e; k++) { if (k > s && src[k] == src[w - 1]) { collapsed++; continue; } src[w++] = src[k]; }
-    targets++; links += w - s; vput(o, bypos[t], &bytes); vput(o, w - s, &bytes);
-    uint64_t ps = 0;
-    for (uint64_t k = s; k < w; k++) { uint64_t g = src[k]; vput(o, g - ps, &bytes); ps = g; }
+  if (part == 0 || part > E) part = E;
+  if (part < maxdeg) part = maxdeg;                         // one target's links are never split
+  uint32_t *src = xmalloc((part ? part : 1) * 4);
+  FILE *o = xopen(outp, "wb"); uint64_t bytes = 0, targets = 0, links = 0, collapsed = 0, parts = 0;
+  for (uint64_t t0 = 0; t0 < M;) {                          // parts in target order, so OUT stays in global order
+    uint64_t base = off[t0], t1 = t0;
+    while (t1 < M && off[t1 + 1] - base <= part) t1++;
+    if (t1 == t0) die("a target does not fit a part");     // cannot happen: part >= maxdeg
+    uint64_t pend = off[t1], e2 = 0, placed = 0, h2[2] = {1, 2}; prev = 0; parts++;
+    p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
+    while (edge_line(p, &a, &b)) {
+      if (a >= N || b >= N) die("edge id out of range");
+      if (a < prev) die("edges are not sorted by source (placing pass)");
+      prev = a; e2++; fp_add(h2, a, b);
+      uint32_t t = pos[b];
+      if (t < t0 || t >= t1) continue;
+      if (off[t] >= pend) die("a placing pass differs from pass 1");
+      src[off[t]++ - base] = bypos[pos[a]]; placed++;      // off[t] walks from t's start to its end
+    }
+    if (pclose(p)) die("edge command failed on a placing pass");
+    if (e2 != E) die("a placing pass read a different number of edges");
+    if (h1[0] != h2[0] || h1[1] != h2[1]) die("a placing pass read different edges than pass 1 (fingerprint)");
+    if (placed != pend - base) die("a placing pass placed a different number of links than pass 1 counted");
+    uint64_t s = base;                                      // after the pass off[t] is t's end, so t+1 starts there
+    for (uint64_t t = t0; t < t1; s = off[t], t++) {
+      uint64_t e = off[t]; if (e < s || e > pend) die("inbound offsets do not add up");
+      if (s == e) continue;
+      uint32_t *v = src + (s - base); uint64_t n = e - s;
+      qsort(v, n, 4, cmp_u32);
+      uint64_t w = 0;                                       // a link repeated through a shared name is kept once
+      for (uint64_t k = 0; k < n; k++) { if (k > 0 && v[k] == v[w - 1]) { collapsed++; continue; } v[w++] = v[k]; }
+      targets++; links += w; vput(o, bypos[t], &bytes); vput(o, w, &bytes);
+      uint64_t ps = 0;
+      for (uint64_t k = 0; k < w; k++) { uint64_t g = v[k]; vput(o, g - ps, &bytes); ps = g; }
+    }
+    if (s != pend) die("inbound offsets do not add up");
+    t0 = t1;
   }
   if (fclose(o)) die("close failed");
+  free(src); free(off);
   if (collapsed > E / 1000 + 1000) { fprintf(stderr, "lg: %llu repeated links: the release repeats edges\n", (unsigned long long)collapsed); exit(3); }
-  printf("{\"nodes\": %llu, \"distinct\": %llu, \"edges\": %llu, \"targets\": %llu, \"links\": %llu, \"repeats_collapsed\": %llu, \"bytes\": %llu}\n",
-         (unsigned long long)N, (unsigned long long)M, (unsigned long long)E, (unsigned long long)targets, (unsigned long long)links, (unsigned long long)collapsed, (unsigned long long)bytes);
+  printf("{\"nodes\": %llu, \"distinct\": %llu, \"edges\": %llu, \"targets\": %llu, \"links\": %llu, \"repeats_collapsed\": %llu, \"bytes\": %llu, \"parts\": %llu}\n",
+         (unsigned long long)N, (unsigned long long)M, (unsigned long long)E, (unsigned long long)targets, (unsigned long long)links, (unsigned long long)collapsed, (unsigned long long)bytes, (unsigned long long)parts);
   return 0;
 }
 
@@ -514,7 +531,7 @@ static int cmd_lookup(const char *dir, const char *namesp, const char *domain) {
 int main(int argc, char **argv) {
   if (argc == 4 && !strcmp(argv[1], "names")) return cmd_names(argv[2], argv[3]);
   if (argc == 7 && !strcmp(argv[1], "dictmerge")) return cmd_dictmerge(argv[2], argv[3], argv[4], argv[5], argv[6]);
-  if (argc == 8 && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6], argv[7]);
+  if ((argc == 8 || argc == 9) && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6], argv[7], argc == 9 ? num(argv[8], 1ULL << 40, "PART_LINKS") : 0);
   if ((argc == 9 || argc == 10) && !strcmp(argv[1], "merge")) return cmd_merge((int)num(argv[2], 254, "REL_INDEX"), argv[3], argv[4], argv[5], argv[6], argv[7], num(argv[8], 1ULL << 24, "SHARD_KB"), argc == 10 ? argv[9] : NULL);
   if (argc == 3 && !strcmp(argv[1], "checkidx")) {   // full validation of a history index; prints its release
     int rel; uint64_t sh, *rc, *by; read_idx_head(argv[2], &rel, &sh, &rc, &by, NULL);

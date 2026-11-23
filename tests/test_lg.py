@@ -8,7 +8,7 @@ Builds four synthetic releases whose domains overlap and drift (names come and g
 runs the real pipeline (names -> dictmerge -> inbound -> merge) release by release with tiny shards, and compares
 every link's first and last release with the reference. Then checks that bad input is refused.
 """
-import os, random, shutil, subprocess, sys, tempfile
+import json, os, random, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -90,6 +90,13 @@ def body():
         run("names", f"{d}/names.txt", f"{d}/order.u32", stdin=vtx)
         run("dictmerge", prev_global or "-", f"{d}/names.txt", f"{d}/global.txt", f"{d}/map_old.u32", f"{d}/map_rel.u32")
         run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{d}/rel.bin", f"cat {d}/edges.txt")
+        whole = open(f"{d}/rel.bin", "rb").read()
+        for part in (1, 7, 97, len(edges) // 3, len(edges), len(edges) * 5):   # memory-sized parts write the same file
+            r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{d}/part.bin", f"cat {d}/edges.txt", str(part))
+            got = json.loads(r.stdout)["parts"]
+            check(f"release {ri}: parts of {part} links ({got} parts) write the same inbound file", open(f"{d}/part.bin", "rb").read() == whole)
+            if part == 97:
+                check(f"release {ri}: 97-link parts really split", got > 2, str(got))
         hd = f"{d}/hist"; os.makedirs(hd)
         prevcmd = f"cat {prev_dir}/h-*.bin" if prev_dir else "-"
         previdx = f"{prev_dir}/history.idx" if prev_dir else "-"
@@ -159,6 +166,18 @@ def body():
     os.chmod(flip, 0o755)
     r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", flip, ok=False)
     check("second pass differing refused", r.returncode != 0, r.stderr.strip()[:80])
+    for k, why in ((3, "a later placing pass reading a changed edge"), (2, "the first placing pass reading a changed edge")):
+        cnt = f"{W}/cnt{k}"
+        late = f"{W}/late{k}.sh"   # the k-th run of the edge command flips one edge's target; parts of 97 need 4+ runs
+        open(late, "w").write(f"#!/bin/sh\necho x >> {cnt}\nif [ $(wc -l < {cnt}) -eq {k} ]; then awk -F'\\t' 'NR==1{{$2=($2==0?1:0)}} {{print $1\"\\t\"$2}}' {d}/edges.txt; else cat {d}/edges.txt; fi\n")
+        os.chmod(late, 0o755)
+        r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", late, "97", ok=False)
+        check(f"parts: {why} refused", r.returncode != 0, r.stderr.strip()[:80])
+    short = f"{W}/short.sh"; cnt = f"{W}/cntshort"   # a later pass losing its last edge
+    open(short, "w").write(f"#!/bin/sh\necho x >> {cnt}\nif [ $(wc -l < {cnt}) -ge 3 ]; then sed '$d' {d}/edges.txt; else cat {d}/edges.txt; fi\n")
+    os.chmod(short, 0o755)
+    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", short, "97", ok=False)
+    check("parts: a later pass with an edge missing refused", r.returncode != 0, r.stderr.strip()[:80])
     os.makedirs(f"{W}/again")
     r = run("merge", "3", f"cat {prev_dir}/h-*.bin", f"{prev_dir}/history.idx", f"{d}/map_old.u32", f"{d}/rel.bin", f"{W}/again", "2", ok=False)
     check("same release twice refused", r.returncode != 0)
