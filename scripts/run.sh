@@ -65,7 +65,8 @@ fixed=$(( 20 * (N + 1) ))
 avail=$(awk '/MemAvailable/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "$avail" -gt 0 ]; then room=$(( (avail - 1500000000 - fixed) / 4 )); else room=$E; fi
 [ "$room" -gt 0 ] || { echo "not enough memory for $N nodes ($((avail / 1000000)) MB available)"; exit 1; }
-if [ "$room" -ge "$E" ]; then PARTS=1; PART=$E; else PARTS=$(( (E + room - 1) / room )); PART=$(( (E + PARTS - 1) / PARTS )); fi
+# Parts are cut at domain boundaries, so each is filled up to the room (an even split spills into an extra part).
+if [ "$room" -ge "$E" ]; then PARTS=1; PART=$E; else PARTS=$(( (E + room - 1) / room )); PART=$room; fi
 [ "$PARTS" -le "${LG_MAX_PARTS:-6}" ] || { echo "would need $PARTS passes over the links ($((avail / 1000000)) MB available): stop"; exit 1; }
 log "nodes $N links $E, memory about $(( (fixed + 4 * PART) / 1000000 )) MB in $PARTS part(s) of $PART links"
 
@@ -83,8 +84,16 @@ fi
 "$LG" dictmerge "$OLD" rel_names.txt domains.txt map_old.u32 map_rel.u32
 rm -f rel_names.txt old_domains.txt
 
-log "inbound ($((PARTS + 1)) streamed passes)"
-"$LG" inbound "$N" "$E" map_rel.u32 rel_pos.u32 rel.bin "curl -sSf --retry 5 --retry-delay 30 '$B-domain-edges.txt.gz' | gzip -dc" "$PART"
+# With more than one part, the counting pass keeps a binary copy of the links (~5 bytes each) and the placing passes
+# read it: one download and one text parse instead of one per pass. Only when the disk holds it and the output.
+CACHE=""
+if [ "$PARTS" -gt 1 ]; then
+  disk=$(df -Pk . | awk 'NR==2 {print $4 * 1024}')
+  if [ "$disk" -gt $(( 10 * E + 5000000000 )) ]; then CACHE=edges.cache; fi
+fi
+log "inbound: ${PARTS} part(s), placing passes read ${CACHE:-the edge download again}"
+"$LG" inbound "$N" "$E" map_rel.u32 rel_pos.u32 rel.bin "curl -sSf --retry 5 --retry-delay 30 '$B-domain-edges.txt.gz' | gzip -dc" "$PART" ${CACHE:+"$CACHE"}
+rm -f edges.cache
 rm -f map_rel.u32 rel_pos.u32
 
 log "merge into history"

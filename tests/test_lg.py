@@ -97,6 +97,11 @@ def body():
             check(f"release {ri}: parts of {part} links ({got} parts) write the same inbound file", open(f"{d}/part.bin", "rb").read() == whole)
             if part == 97:
                 check(f"release {ri}: 97-link parts really split", got > 2, str(got))
+            cache = f"{d}/edges.cache"   # placing passes read the counting pass's binary copy instead of the command
+            r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{d}/part.bin", f"cat {d}/edges.txt", str(part), cache)
+            check(f"release {ri}: parts of {part} links from the edge cache write the same inbound file", open(f"{d}/part.bin", "rb").read() == whole)
+            check(f"release {ri}: the edge cache holds every link", os.path.getsize(cache) >= 2 * len(edges), str(os.path.getsize(cache)))
+            os.remove(cache)
         hd = f"{d}/hist"; os.makedirs(hd)
         prevcmd = f"cat {prev_dir}/h-*.bin" if prev_dir else "-"
         previdx = f"{prev_dir}/history.idx" if prev_dir else "-"
@@ -178,6 +183,17 @@ def body():
     r = run("inbound", "10", "9", ident10, ident10, f"{W}/hub.bin", f"cat {W}/hub.txt", "5")
     j = json.loads(r.stdout)
     check("a domain over a part gets a part of its own, reported", j["part_links"] == 9 and j["max_links_one_domain"] == 9 and j["parts"] == 1 and "more than a part" in r.stderr, r.stdout + r.stderr)
+    once = f"{W}/once.sh"; cnt = f"{W}/cntonce"   # with a cache the edge command runs exactly once
+    open(once, "w").write(f"#!/bin/sh\necho x >> {cnt}\ncat {d}/edges.txt\n"); os.chmod(once, 0o755)
+    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", once, "97", f"{W}/once.cache")
+    check("with a cache the edge command runs once, however many parts", open(cnt).read().count("x") == 1 and json.loads(r.stdout)["parts"] > 2)
+    r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", f"cat {d}/edges.txt", "97", f"{W}/no-such-dir/edges.cache", ok=False)
+    check("an edge cache that cannot be written refused", r.returncode != 0, r.stderr.strip()[:80])
+    if os.path.exists("/dev/full"):   # Linux: a full disk mid-write
+        r = run("inbound", str(len(names)), str(len(edges)), f"{d}/map_rel.u32", f"{d}/order.u32", f"{W}/x.bin", f"cat {d}/edges.txt", "97", "/dev/full", ok=False)
+        check("an edge cache on a full disk refused", r.returncode != 0 and "edge cache" in r.stderr, r.stderr.strip()[:80])
+    else:
+        print("note: /dev/full absent; the full-disk cache check runs on Linux (CI) only")
     short = f"{W}/short.sh"; cnt = f"{W}/cntshort"   # a later pass losing its last edge
     open(short, "w").write(f"#!/bin/sh\necho x >> {cnt}\nif [ $(wc -l < {cnt}) -ge 3 ]; then sed '$d' {d}/edges.txt; else cat {d}/edges.txt; fi\n")
     os.chmod(short, 0o755)

@@ -10,12 +10,16 @@
 //                                   1000 + N/1000 duplicates means a broken file and stops. Refuses ids that skip.
 //   lg dictmerge OLD|- REL NEW MAP_OLD MAP_REL
 //                                   Union of two sorted name lists -> NEW (+ NEW.idx), and u32 maps old->new, rel->new.
-//   lg inbound N E MAP_REL POS OUT CMD [PART_LINKS]
+//   lg inbound N E MAP_REL POS OUT CMD [PART_LINKS [CACHE]]
 //                                   Runs CMD (it must print the release's "from<TAB>to" edges, sorted by from) once to
 //                                   count, then once per part to place: "who links to X" in ~16 bytes a node + 4 a
 //                                   link of the part. A part is a run of targets holding at most PART_LINKS links
 //                                   (default E: one part; a target with more links than that is a part of its own).
 //                                   Every placing pass must read the counting pass's edges exactly, or it stops.
+//                                   With CACHE, the counting pass also writes the edges there (varint source gap,
+//                                   varint target; ~5 bytes a link) and placing passes read that file instead of
+//                                   running CMD again: no second download or text parse. The same count and
+//                                   fingerprint checks apply to every pass. The caller deletes CACHE.
 //                                   POS maps release ids to distinct-name positions, MAP_REL positions to global ids.
 //                                   OUT: records (target, count, sources) in global ids, targets and sources ascending;
 //                                   a link repeated because two ids share a name is written once.
@@ -79,6 +83,18 @@ static int vget(FILE *f, uint64_t *x) {   // 1 ok, 0 clean end before the first 
     v |= (uint64_t)(c & 127) << sh;
     if (c < 128) break;
     sh += 7; if (sh > 63) die("bad varint");
+  }
+  *x = v; return 1;
+}
+static int vget_fast(FILE *f, uint64_t *x) {   // vget for one-reader streams (the edge cache)
+  uint64_t v = 0; int sh = 0, c;
+  for (;;) {
+    c = getc_unlocked(f);
+    if (c == EOF) { if (ferror(f)) die("read error in the edge cache"); if (sh == 0) return 0; die("truncated edge cache"); }
+    if (sh == 63 && c > 1) die("varint overflow in the edge cache");
+    v |= (uint64_t)(c & 127) << sh;
+    if (c < 128) break;
+    sh += 7; if (sh > 63) die("bad varint in the edge cache");
   }
   *x = v; return 1;
 }
@@ -216,7 +232,18 @@ static int cmd_dictmerge(const char *oldp, const char *relp, const char *newp, c
 
 // ---------- inbound ----------
 static int cmp_u32(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
-static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *posp, const char *outp, const char *cmd, uint64_t part) {
+static void cput(FILE *f, uint64_t x) { while (x >= 128) { putc_unlocked((int)(x & 127) | 128, f); x >>= 7; } putc_unlocked((int)x, f); }
+// One edge from a placing pass: the edge command's text, or the cache the counting pass wrote. 1 = an edge, 0 = end.
+static int next_edge(FILE *p, int cached, uint64_t N, uint64_t *prev, uint64_t *a, uint64_t *b) {
+  if (!cached) return edge_line(p, a, b);
+  uint64_t d;
+  if (!vget_fast(p, &d)) return 0;
+  if (d >= N || *prev + d >= N) die("edge id out of range in the edge cache");
+  *a = *prev + d;
+  if (!vget_fast(p, b)) die("truncated edge cache");
+  return 1;
+}
+static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *posp, const char *outp, const char *cmd, uint64_t part, const char *cache) {
   uint64_t M, np; uint32_t *bypos = load_u32(maprelp, &M), *pos = load_u32(posp, &np);
   if (np != N) die("release position file size differs from the node count");
   if (M > N || (N && !M)) die("release map size is impossible for the node count");
@@ -227,12 +254,16 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
     free(used); }
   uint32_t *indeg = xcalloc(M ? M : 1, 4); uint64_t a, b, e1 = 0, prev = 0, h1[2] = {1, 2};
   FILE *p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
+  FILE *cw = NULL;
+  if (cache) { cw = xopen(cache, "wb"); setvbuf(cw, NULL, _IOFBF, 1 << 22); }
   while (edge_line(p, &a, &b)) {
     if (a >= N || b >= N) die("edge id out of range");
     if (a < prev) die("edges are not sorted by source");
+    if (cw) { cput(cw, a - prev); cput(cw, b); }
     prev = a; indeg[pos[b]]++; e1++; fp_add(h1, a, b);
   }
   if (pclose(p)) die("edge command failed on pass 1");
+  if (cw && (ferror(cw) || fclose(cw))) die("cannot write the edge cache");
   if (e1 != E) { fprintf(stderr, "lg: pass 1 read %llu edges, properties say %llu\n", (unsigned long long)e1, (unsigned long long)E); exit(4); }
   uint64_t *off = xmalloc((M + 1) * 8), maxdeg = 0; off[0] = 0;   // off[t]: where target t's links start
   for (uint64_t i = 0; i < M; i++) { off[i + 1] = off[i] + indeg[i]; if (indeg[i] > maxdeg) maxdeg = indeg[i]; }
@@ -251,17 +282,19 @@ static int cmd_inbound(uint64_t N, uint64_t E, const char *maprelp, const char *
     while (t1 < M && off[t1 + 1] - base <= part) t1++;
     if (t1 == t0) die("a target does not fit a part");     // cannot happen: part >= maxdeg
     uint64_t pend = off[t1], e2 = 0, placed = 0, h2[2] = {1, 2}; prev = 0; parts++;
-    p = popen(cmd, "r"); if (!p) die("cannot run the edge command");
-    while (edge_line(p, &a, &b)) {
+    if (cache) { p = xopen(cache, "rb"); setvbuf(p, NULL, _IOFBF, 1 << 22); }
+    else { p = popen(cmd, "r"); if (!p) die("cannot run the edge command"); }
+    while (next_edge(p, cache != NULL, N, &prev, &a, &b)) {
       if (a >= N || b >= N) die("edge id out of range");
       if (a < prev) die("edges are not sorted by source (placing pass)");
-      prev = a; e2++; fp_add(h2, a, b);
+      if (++e2 > E) die("a placing pass read more edges than pass 1");   // stops an endless stream early
+      prev = a; fp_add(h2, a, b);
       uint32_t t = pos[b];
       if (t < t0 || t >= t1) continue;
       if (off[t] >= pend) die("a placing pass differs from pass 1");
       src[off[t]++ - base] = bypos[pos[a]]; placed++;      // off[t] walks from t's start to its end
     }
-    if (pclose(p)) die("edge command failed on a placing pass");
+    if (cache ? fclose(p) != 0 : pclose(p) != 0) die("edge command failed on a placing pass");
     if (e2 != E) die("a placing pass read a different number of edges");
     if (h1[0] != h2[0] || h1[1] != h2[1]) die("a placing pass read different edges than pass 1 (fingerprint)");
     if (placed != pend - base) die("a placing pass placed a different number of links than pass 1 counted");
@@ -535,7 +568,7 @@ static int cmd_lookup(const char *dir, const char *namesp, const char *domain) {
 int main(int argc, char **argv) {
   if (argc == 4 && !strcmp(argv[1], "names")) return cmd_names(argv[2], argv[3]);
   if (argc == 7 && !strcmp(argv[1], "dictmerge")) return cmd_dictmerge(argv[2], argv[3], argv[4], argv[5], argv[6]);
-  if ((argc == 8 || argc == 9) && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6], argv[7], argc == 9 ? num(argv[8], 1ULL << 40, "PART_LINKS") : 0);
+  if (argc >= 8 && argc <= 10 && !strcmp(argv[1], "inbound")) return cmd_inbound(num(argv[2], UINT32_MAX, "N"), num(argv[3], 1ULL << 40, "E"), argv[4], argv[5], argv[6], argv[7], argc >= 9 ? num(argv[8], 1ULL << 40, "PART_LINKS") : 0, argc == 10 ? argv[9] : NULL);
   if ((argc == 9 || argc == 10) && !strcmp(argv[1], "merge")) return cmd_merge((int)num(argv[2], 254, "REL_INDEX"), argv[3], argv[4], argv[5], argv[6], argv[7], num(argv[8], 1ULL << 24, "SHARD_KB"), argc == 10 ? argv[9] : NULL);
   if (argc == 3 && !strcmp(argv[1], "checkidx")) {   // full validation of a history index; prints its release
     int rel; uint64_t sh, *rc, *by; read_idx_head(argv[2], &rel, &sh, &rc, &by, NULL);
