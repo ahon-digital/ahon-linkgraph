@@ -104,9 +104,22 @@ if [ "$RI" = 0 ]; then PREV=-; PREVIDX=-; else
   PREVIDX=prev.idx
   PREV="python3 '$here/hf.py' cat $(grep -v '^#' prev.idx | cut -f1 | uniq | awk '{printf "history/h-%05d.bin ", $1}')"
 fi
-if [ "${LG_DRY:-0}" = 1 ]; then HOOK="true"; else HOOK="sh -c 'python3 \"$here/hf.py\" put \"\$0\" history/\$(basename \"\$0\") manifest.tsv && rm -f \"\$0\"'"; fi
+if [ "${LG_DRY:-0}" = 1 ]; then HOOK="true"; else
+  # Shards upload WORKERS at a time while the merge writes the next ones (one at a time took 2.5 min a shard on
+  # release 37, past the 6 h job limit). Any failed upload stops the merge, and nothing is committed.
+  rm -rf upq; mkdir upq
+  python3 "$here/uploader.py" upq manifest.tsv "${LG_UPLOADERS:-4}" &
+  export UPQ="$W/upq" UP_PID=$!
+  trap 'kill "$UP_PID" 2>/dev/null || true' EXIT
+  HOOK="sh '$here/queue_shard.sh'"
+fi
 "$LG" merge "$RI" "$PREV" "$PREVIDX" map_old.u32 rel.bin hist "$SHARD_KB" "$HOOK" | tee merge.json
 rm -f map_old.u32 rel.bin
+if [ "${LG_DRY:-0}" != 1 ]; then
+  touch upq/DONE
+  wait "$UP_PID" || { echo "a shard upload failed: stop"; exit 1; }
+  trap - EXIT
+fi
 
 if [ "${LG_DRY:-0}" = 1 ]; then log "dry run: built $(ls hist | wc -l) files, uploaded nothing"; du -sh hist; exit 0; fi
 log "publish"
