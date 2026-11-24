@@ -37,9 +37,20 @@ for ri in range(3):
 open(T + "/list.txt", "w").write("\n".join(names_list) + "\n")
 
 
+RELATIVE = os.environ.get("LG_E2E_RELATIVE") == "1"   # review 24 Nov: a relative LG_WORK, with a decoy queue where
+                                                       # a path resolved twice (cwd, then cwd/LG_WORK) would land
+
+
 def step(i):
     w = f"{T}/work{i}"
-    p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=w), capture_output=True, text=True)
+    if RELATIVE:
+        os.makedirs(f"{w}/work{i}/upq", exist_ok=True)
+        p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=f"work{i}"), cwd=T, capture_output=True, text=True)
+        stranded = [n for n in os.listdir(f"{w}/work{i}/upq") if n.endswith(".bin")]
+        if stranded:
+            fails.append(f"run {i}: {len(stranded)} shards stranded in the decoy queue")
+    else:
+        p = subprocess.run(["bash", f"{ROOT}/scripts/run.sh"], env=dict(env, LG_WORK=w), capture_output=True, text=True)
     if p.returncode:
         print(p.stdout[-1500:], p.stderr[-1500:])
         raise SystemExit(f"run {i} failed")

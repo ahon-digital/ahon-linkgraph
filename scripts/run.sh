@@ -12,7 +12,7 @@ SHARD_KB=${LG_SHARD_KB:-524288}
 CC=${LG_CC_BASE:-https://data.commoncrawl.org/projects/hyperlinkgraph}
 # these paths are pasted into commands lg runs; plain characters only
 for p in "$here" "$W"; do case "$p" in *[!A-Za-z0-9/_.-]*) echo "unsafe path: $p"; exit 1;; esac; done
-mkdir -p "$W"; cd "$W"
+mkdir -p "$W"; cd "$W"; W=$(pwd -P)   # absolute from here on: every later "$W/..." must name this same folder
 log() { echo "== $(date -u +%FT%TZ) $*"; }
 
 log "release list"
@@ -130,6 +130,11 @@ python3 "$here/hf.py" put domains.txt domains.txt manifest.tsv
 python3 "$here/hf.py" put domains.txt.idx domains.txt.idx manifest.tsv
 python3 "$here/hf.py" put releases.tsv releases.tsv manifest.tsv
 python3 "$here/hf.py" put "$here/../dataset/README.md" README.md manifest.tsv
+# every shard the new index names must be in this commit's manifest, or the commit's --delete-missing would publish
+# an index pointing at shards that are gone; a shard lost anywhere upstream stops here
+want=$(awk -F'\t' '$1 == "#shard" { printf "history/h-%05d.bin\n", $2 }' hist/history.idx | sort -u)
+have=$(cut -f1 manifest.tsv | { grep '^history/h-' || true; } | sort -u)   # none is a mismatch to report, not a silent exit
+[ -n "$want" ] && [ "$want" = "$have" ] || { echo "the manifest does not hold exactly the shards the index names: stop"; exit 1; }
 python3 "$here/hf.py" commit "add $R (release $RI)" manifest.tsv --delete-missing history/
 python3 "$here/hf.py" squash
 touch "$W/did_work"
