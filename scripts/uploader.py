@@ -25,22 +25,35 @@ def main():
     failed = os.path.join(queue, "FAILED")
     taken, futures = set(), []
 
-    def upload(name):
-        path = os.path.join(queue, name)
-        r = subprocess.run([sys.executable, os.path.join(here, "hf.py"), "put", path, f"history/{name}", manifest],
-                           capture_output=True, text=True)
-        if r.returncode:
-            open(failed, "w").write(name + "\n")
-            sys.stderr.write(f"uploader: {name} failed: {r.stderr.strip()[-300:]}\n")
-            return False
-        sys.stdout.write(r.stdout)
-        sys.stdout.flush()
-        os.remove(path)
-        return True
+    def fail(why):
+        try:
+            open(failed, "a").write(why + "\n")
+        finally:   # if even that fails, the non-zero exit below still stops the hook (it checks this process is alive)
+            sys.stderr.write(f"uploader: {why}\n")
 
-    with ThreadPoolExecutor(workers) as ex:
+    def upload(name):
+        try:   # any exception, not only a failed upload, must reach the failure gate at once
+            path = os.path.join(queue, name)
+            r = subprocess.run([sys.executable, os.path.join(here, "hf.py"), "put", path, f"history/{name}", manifest],
+                               capture_output=True, text=True, timeout=3600)   # a trickling upload ends too
+            if r.returncode:
+                fail(f"{name} failed: {r.stderr.strip()[-300:]}")
+                return False
+            sys.stdout.write(r.stdout)
+            sys.stdout.flush()
+            os.remove(path)
+            return True
+        except BaseException as e:   # noqa: BLE001
+            fail(f"{name}: {type(e).__name__}: {e}")
+            return False
+
+    def broken():   # a finished upload that failed, checked on every poll, not only once the merge is done
+        return os.path.exists(failed) or any(f.done() and (f.cancelled() or f.exception() or not f.result()) for f in futures)
+
+    ex = ThreadPoolExecutor(workers)
+    try:
         while True:
-            if os.path.exists(failed):
+            if broken():
                 break
             done = os.path.exists(os.path.join(queue, "DONE"))
             for name in sorted(os.listdir(queue)):
@@ -51,7 +64,16 @@ def main():
                     n.endswith(".bin") and n not in taken for n in os.listdir(queue)):
                 break
             time.sleep(1)
-    ok = all(f.result() for f in futures) and not os.path.exists(failed)
+    except BaseException as e:   # noqa: BLE001
+        fail(f"uploader loop: {type(e).__name__}: {e}")
+    if broken():
+        ex.shutdown(wait=True, cancel_futures=True)   # queued uploads are dropped; nothing will be committed
+        if not os.path.exists(failed):
+            fail("an upload did not complete")
+        print('{"uploaded_shards": null, "ok": false}')
+        return 1
+    ex.shutdown(wait=True)
+    ok = all(f.result() for f in futures) and not broken()
     print(f'{{"uploaded_shards": {sum(1 for f in futures if f.result())}, "ok": {"true" if ok else "false"}}}')
     return 0 if ok else 1
 

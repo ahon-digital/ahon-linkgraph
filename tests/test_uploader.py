@@ -17,6 +17,8 @@ open(log, "a").write("start " + a[2] + "\\n")
 time.sleep(float(os.environ.get("STUB_SLEEP", "0.3")))
 if os.path.basename(a[1]) == os.environ.get("STUB_FAIL", ""):
     sys.exit("stub: upload refused")
+if os.path.basename(a[1]) == os.environ.get("STUB_VANISH", ""):
+    os.remove(a[1])   # the uploader's own removal then raises: an exception inside a worker
 open(a[3], "a").write(a[2] + "\\n")
 open(log, "a").write("end " + a[2] + "\\n")
 print('{"uploaded": "%s"}' % a[2])
@@ -93,7 +95,22 @@ def body():
     check("hook waits while the queue is full", r.returncode == 0 and waited > 0.8, f"{waited:.2f}s {r.stderr}")
     open(f"{d}/q/DONE", "w").close(); up.communicate(timeout=60)
     shutil.rmtree(d)
-    # 4. the uploader gone: the hook refuses instead of waiting forever
+    # 4. review r20: an exception inside a worker reaches the failure gate at once, with no DONE, so nothing waits
+    d = setup(); env = dict(os.environ, STUB_LOG=f"{d}/log", STUB_VANISH="h-00001.bin", STUB_SLEEP="0.1")
+    up = start(d, env)
+    for i in range(3):
+        hook(d, env, f"h-{i:05d}.bin", up.pid)
+    try:
+        up.communicate(timeout=20)   # DONE is never written: a wedged uploader would hang here
+        exited = True
+    except subprocess.TimeoutExpired:
+        up.kill(); up.communicate(); exited = False
+    check("a worker exception ends the uploader without waiting for the merge", exited and up.returncode != 0, str(up.returncode))
+    check("a worker exception writes FAILED", os.path.exists(f"{d}/q/FAILED"))
+    r = hook(d, env, "h-00009.bin", up.pid)
+    check("the hook refuses after a worker exception", r.returncode != 0, r.stderr)
+    shutil.rmtree(d)
+    # 5. the uploader gone: the hook refuses instead of waiting forever
     d = setup(); env = dict(os.environ, STUB_LOG=f"{d}/log")
     dead = subprocess.Popen(["true"]); dead.wait()
     r = hook(d, env, "h-00000.bin", dead.pid)
