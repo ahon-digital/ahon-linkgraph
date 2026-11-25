@@ -30,7 +30,7 @@ FAKE_KICK=1 FAKE_LINE="ok: 51 of 52" run
 check "a second kick within 3 h does not start another build" '[ ! -s "$T/gh.log" ]'
 rm -f "$T/state/linkgraph-watch.kicked"
 FAKE_KICK=1 FAKE_GH_RC=1 FAKE_LINE="ok: 51 of 52" run
-check "a failed start pages" 'grep -q "starting the build failed" "$T/notify.log" && [ ! -e "$T/state/linkgraph-watch.kicked" ]'
+check "a failed start pages and keeps the reservation (one attempt per 3 h)" 'grep -q "starting the build failed" "$T/notify.log" && [ -e "$T/state/linkgraph-watch.kicked" ]'
 FAKE_KICK=0 FAKE_LINE="ok: 52 of 52" run
 check "no kick file, no build" '[ ! -s "$T/gh.log" ]'
 FAKE_KICK=0 FAKE_LINE="link history: behind Common Crawl and nothing added for 14 h" run
@@ -50,4 +50,13 @@ rm -f "$T/state/linkgraph-watch.kicked"; : > "$T/gh.log"
 ( exec 9>>"$T/state/linkgraph-watch.lock"; perl -e 'use Fcntl qw(:flock); open(my $f, ">&=9"); flock($f, LOCK_EX)'; kill -9 $BASHPID ) 2>/dev/null
 FAKE_KICK=1 FAKE_LINE="ok: 51 of 52" run
 check "a crashed holder leaves no lock behind" 'grep -q "workflow run" "$T/gh.log"'
+rm -f "$T/state/linkgraph-watch.kicked"; : > "$T/gh.log"
+cat > "$T/gh-crash" <<'SH'
+#!/bin/bash
+echo "$@" >> "$FAKE_GH_LOG"; kill -9 $PPID
+SH
+chmod +x "$T/gh-crash"
+LG_WATCH_GH="$T/gh-crash" FAKE_KICK=1 FAKE_LINE="ok: 51 of 52" bash "$HERE/deploy/linkgraph-watch.sh" > "$T/c1" 2>&1
+FAKE_KICK=1 FAKE_LINE="ok: 51 of 52" bash "$HERE/deploy/linkgraph-watch.sh" > "$T/c2" 2>&1
+check "Codex r3: a crash right after dispatch never leads to a second build" '[ "$(grep -c "workflow run" "$T/gh.log")" = 1 ]'
 echo "$n checks, $fails failed"; rm -rf "$T"; exit $((fails>0))

@@ -27,10 +27,15 @@ msg=$(cd "$REPO_DIR" && python3 -B scripts/watch.py --kick-file "$KICK" 2>&1 | t
 echo "$(date -u +%FT%TZ) $msg"
 if [ -e "$KICK" ]; then
   if [ -z "$(find "$KICKED" -mmin -180 2>/dev/null)" ]; then
-    if $TIMEOUT $GH workflow run build.yml -R ahon-digital/ahon-linkgraph >/dev/null 2>&1; then
-      touch "$KICKED"; echo "$(date -u +%FT%TZ) kicked the build: $(cat "$KICK")"
+    # Reserve BEFORE dispatching (Codex r3: a crash between dispatch and stamp let a second build start). A failed or
+    # uncertain dispatch keeps the reservation and pages: at most one attempt per 3 h, whatever happens. The build
+    # workflow also has concurrency group "linkgraph", so even a duplicate would queue, never run in parallel.
+    if ! touch "$KICKED"; then
+      $NOTIFY --severity warn -m "link history: behind and idle, but the kick stamp cannot be written; not starting a build"
+    elif $TIMEOUT $GH workflow run build.yml -R ahon-digital/ahon-linkgraph >/dev/null 2>&1; then
+      echo "$(date -u +%FT%TZ) kicked the build: $(cat "$KICK")"
     else
-      $NOTIFY --severity warn -m "link history: behind and idle, and starting the build failed (gh workflow run)"
+      $NOTIFY --severity warn -m "link history: behind and idle, and starting the build failed (gh workflow run); next try in 3 h"
     fi
   else
     echo "$(date -u +%FT%TZ) kick wanted, but one was sent under 3 h ago"
