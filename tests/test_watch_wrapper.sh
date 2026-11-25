@@ -40,8 +40,14 @@ FAKE_KICK=1 FAKE_GH_SLEEP=1 FAKE_LINE="ok: 51 of 52" bash "$HERE/deploy/linkgrap
 FAKE_KICK=1 FAKE_GH_SLEEP=1 FAKE_LINE="ok: 51 of 52" bash "$HERE/deploy/linkgraph-watch.sh" > "$T/o2" 2>&1 &
 wait
 check "Codex r1: two overlapping runs dispatch exactly once" '[ "$(grep -c "workflow run" "$T/gh.log")" = 1 ] && grep -q "holds the lock" "$T/o1" "$T/o2"'
-check "the lock is released after a run" '[ ! -e "$T/state/linkgraph-watch.lock" ]'
-mkdir "$T/state/linkgraph-watch.lock"; touch -t 202601010000 "$T/state/linkgraph-watch.lock"; rm -f "$T/state/linkgraph-watch.kicked"
+rm -f "$T/state/linkgraph-watch.kicked"; : > "$T/gh.log"
 FAKE_KICK=1 FAKE_LINE="ok: 51 of 52" run
-check "a stale lock (crashed run) is taken over" 'grep -q "workflow run" "$T/gh.log"'
+check "the lock is released when a run ends (a later run dispatches)" 'grep -q "workflow run" "$T/gh.log"'
+rm -f "$T/state/linkgraph-watch.kicked"; : > "$T/gh.log"
+for i in 1 2 3 4 5 6; do FAKE_KICK=1 FAKE_GH_SLEEP=1 FAKE_LINE="ok: 51 of 52" bash "$HERE/deploy/linkgraph-watch.sh" > "$T/p$i" 2>&1 & done; wait
+check "Codex r2: six simultaneous runs dispatch exactly once" '[ "$(grep -c "workflow run" "$T/gh.log")" = 1 ]'
+rm -f "$T/state/linkgraph-watch.kicked"; : > "$T/gh.log"
+( exec 9>>"$T/state/linkgraph-watch.lock"; perl -e 'use Fcntl qw(:flock); open(my $f, ">&=9"); flock($f, LOCK_EX)'; kill -9 $BASHPID ) 2>/dev/null
+FAKE_KICK=1 FAKE_LINE="ok: 51 of 52" run
+check "a crashed holder leaves no lock behind" 'grep -q "workflow run" "$T/gh.log"'
 echo "$n checks, $fails failed"; rm -rf "$T"; exit $((fails>0))

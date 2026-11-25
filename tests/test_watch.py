@@ -95,6 +95,10 @@ def kick_body():
     check("caught up: no kick", not k and rc == 0, out)
     rc, out = go(tsv(51, 2), runs("success", started_hours_ago=4), ok51)
     check("without --kick-file nothing changes", rc == 0, out)
+    rerun = json.loads(runs("success", started_hours_ago=13))
+    rerun["workflow_runs"][0]["run_started_at"] = (NOW - datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rc, out, k = kick_case(tsv(51, 14), json.dumps(rerun), ok51)
+    check("Codex r2: a rerun started 30 min ago blocks a kick", not k, out)
 
 
 def test_watch():

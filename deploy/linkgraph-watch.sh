@@ -14,14 +14,14 @@ NOTIFY=${LG_WATCH_NOTIFY:-"python3 /opt/ahonos/brain/scripts/misc/diwa-notify.py
 GH=${LG_WATCH_GH:-gh}
 TIMEOUT=${LG_WATCH_TIMEOUT-timeout 120}   # a stalled gh never holds the lock past the next hourly run
 export AHONOS_HOME=/opt/ahonos
-# One run at a time (Codex r1 26 Nov: two overlapping runs both dispatched 0.055 s apart). mkdir is atomic on every
-# filesystem; a lock older than 30 min is a crashed run and is taken over. A skipped run logs; the next hour pages.
-LOCK=$STATE/linkgraph-watch.lock
-if ! mkdir "$LOCK" 2>/dev/null; then
-  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ] && rm -rf "$LOCK" && mkdir "$LOCK" 2>/dev/null; then :
-  else echo "$(date -u +%FT%TZ) another watch run holds the lock; skipped"; exit 0; fi
+# One run at a time, by a KERNEL file lock (Codex r1: overlapping runs both dispatched; r2: a stale-lock takeover
+# let two in). flock(2) is held by this shell's open file description on fd 9 and released by the kernel when the
+# run ends or crashes, so there is no stale lock to take over. perl takes it (present on Linux and macOS; util-linux
+# flock(1) is not on macOS). A run that cannot get the lock logs and exits; the next hour runs.
+exec 9>>"$STATE/linkgraph-watch.lock"
+if ! perl -e 'use Fcntl qw(:flock); open(my $f, ">&=9") or exit 2; flock($f, LOCK_EX | LOCK_NB) or exit 1'; then
+  echo "$(date -u +%FT%TZ) another watch run holds the lock; skipped"; exit 0
 fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 rm -f "$KICK"
 msg=$(cd "$REPO_DIR" && python3 -B scripts/watch.py --kick-file "$KICK" 2>&1 | tr "\n" " " | cut -c1-600)
 echo "$(date -u +%FT%TZ) $msg"

@@ -62,7 +62,9 @@ def main():
     recent = [x["conclusion"] for x in runs[:a.failed_runs]]
     failing = len(recent) == a.failed_runs and all(c == "failure" for c in recent)
     if a.kick_file and done < total and not failing and not any(x.get("status") in ACTIVE for x in listed):
-        starts = [datetime.datetime.fromisoformat(x["created_at"].replace("Z", "+00:00")) for x in listed if x.get("created_at")]
+        # the latest attempt's start, not the run's creation (Codex r2: a rerun of an old run is a recent start)
+        starts = [datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
+                  for x in listed for t in (x.get("run_started_at"), x.get("created_at")) if t]
         if not starts or (now - max(starts)).total_seconds() / 3600 >= a.kick_hours:
             with open(a.kick_file, "w") as f:
                 f.write(f"{now.isoformat()} {done} of {total}\n")
