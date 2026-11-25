@@ -12,13 +12,22 @@ KICKED=$STATE/linkgraph-watch.kicked
 REPO_DIR=${LG_WATCH_REPO:-/opt/ahon-linkgraph}
 NOTIFY=${LG_WATCH_NOTIFY:-"python3 /opt/ahonos/brain/scripts/misc/diwa-notify.py --subsystem linkgraph --product ahonseo"}
 GH=${LG_WATCH_GH:-gh}
+TIMEOUT=${LG_WATCH_TIMEOUT-timeout 120}   # a stalled gh never holds the lock past the next hourly run
 export AHONOS_HOME=/opt/ahonos
+# One run at a time (Codex r1 26 Nov: two overlapping runs both dispatched 0.055 s apart). mkdir is atomic on every
+# filesystem; a lock older than 30 min is a crashed run and is taken over. A skipped run logs; the next hour pages.
+LOCK=$STATE/linkgraph-watch.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ] && rm -rf "$LOCK" && mkdir "$LOCK" 2>/dev/null; then :
+  else echo "$(date -u +%FT%TZ) another watch run holds the lock; skipped"; exit 0; fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 rm -f "$KICK"
 msg=$(cd "$REPO_DIR" && python3 -B scripts/watch.py --kick-file "$KICK" 2>&1 | tr "\n" " " | cut -c1-600)
 echo "$(date -u +%FT%TZ) $msg"
 if [ -e "$KICK" ]; then
   if [ -z "$(find "$KICKED" -mmin -180 2>/dev/null)" ]; then
-    if $GH workflow run build.yml -R ahon-digital/ahon-linkgraph >/dev/null 2>&1; then
+    if $TIMEOUT $GH workflow run build.yml -R ahon-digital/ahon-linkgraph >/dev/null 2>&1; then
       touch "$KICKED"; echo "$(date -u +%FT%TZ) kicked the build: $(cat "$KICK")"
     else
       $NOTIFY --severity warn -m "link history: behind and idle, and starting the build failed (gh workflow run)"
